@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	Name   = "morpheusvm"
-	Symbol = "RED"
+	Name   = "Light-App"
+	Symbol = "LIGHT"
 )
 
 var ID ids.ID
