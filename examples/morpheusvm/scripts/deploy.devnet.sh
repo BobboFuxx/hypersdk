@@ -9,10 +9,10 @@ export CGO_CFLAGS="-O -D__BLST_PORTABLE__"
 
 # project name is expected to be the name of the directory containing the project
 # it should be located in the examples directory of the hypersdk.
-PROJECT_NAME="morpheusvm"
+PROJECT_NAME="Light-App VM"
 
 # Name of the cli binary for the project
-PROJECT_CLI_NAME="morpheus-cli"
+PROJECT_CLI_NAME="light-cli"
 
 # Commit of the MorpheusVM repository to build and install
 PROJECT_VM_COMMIT="c3c9cafd5726aeb4b608e3315922910aeb0baeeb"
