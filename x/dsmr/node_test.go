@@ -15,8 +15,10 @@ import (
 	"github.com/ava-labs/avalanchego/network/p2p/acp118"
 	"github.com/ava-labs/avalanchego/network/p2p/p2ptest"
 	"github.com/ava-labs/avalanchego/proto/pb/sdk"
+	"github.com/ava-labs/avalanchego/snow/validators"
 	"github.com/ava-labs/avalanchego/snow/validators/validatorstest"
 	"github.com/ava-labs/avalanchego/utils/crypto/bls"
+	"github.com/ava-labs/avalanchego/utils/crypto/bls/signer/localsigner"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
@@ -24,19 +26,32 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/hypersdk/codec"
+	"github.com/ava-labs/hypersdk/internal/validitywindow"
+	"github.com/ava-labs/hypersdk/internal/validitywindow/validitywindowtest"
 	"github.com/ava-labs/hypersdk/proto/pb/dsmr"
 	"github.com/ava-labs/hypersdk/x/dsmr/dsmrtest"
-
-	snowValidators "github.com/ava-labs/avalanchego/snow/validators"
 )
 
-const networkID = uint32(123)
+const (
+	networkID                            = uint32(123)
+	testingDefaultValidityWindowDuration = 5 * time.Second
+	testingDefaultMaxProducerChunkWeight = 1024 * 1024
+)
 
 var (
 	_ Tx                    = (*dsmrtest.Tx)(nil)
 	_ Verifier[dsmrtest.Tx] = (*failVerifier)(nil)
+	_ ChainState            = (*testChainState)(nil)
 
-	chainID = ids.Empty
+	chainID         = ids.Empty
+	testRuleFactory = ruleFactory{
+		rules: rules{
+			validityWindow:         int64(testingDefaultValidityWindowDuration),
+			maxProducerChunkWeight: testingDefaultMaxProducerChunkWeight,
+		},
+	}
+
+	errTestingInvalidValidityWindow = errors.New("time validity window testing error")
 )
 
 // Test that chunks can be built through Node.BuildChunk
@@ -101,7 +116,7 @@ func TestNode_BuildChunk(t *testing.T) {
 				return
 			}
 
-			blk, err := node.BuildBlock(node.LastAccepted, tt.expiry)
+			blk, err := node.BuildBlock(context.Background(), node.LastAccepted, tt.expiry)
 			r.NoError(err)
 			r.NoError(node.Verify(context.Background(), node.LastAccepted, blk))
 			executedBlk, err := node.Accept(context.Background(), blk)
@@ -143,7 +158,7 @@ func TestNode_GetChunk_AvailableChunk(t *testing.T) {
 		codec.Address{123},
 	))
 
-	blk, err := node.BuildBlock(node.LastAccepted, node.LastAccepted.Timestamp+1)
+	blk, err := node.BuildBlock(context.Background(), node.LastAccepted, node.LastAccepted.Timestamp+1)
 	r.NoError(err)
 	r.NoError(node.Verify(context.Background(), node.LastAccepted, blk))
 	executedBlk, err := node.Accept(context.Background(), blk)
@@ -371,7 +386,7 @@ func TestNode_AcceptedChunksAvailableOverGetChunk(t *testing.T) {
 				))
 			}
 
-			blk, err := node.BuildBlock(node.LastAccepted, node.LastAccepted.Timestamp+1)
+			blk, err := node.BuildBlock(context.Background(), node.LastAccepted, node.LastAccepted.Timestamp+1)
 			r.NoError(err)
 			r.NoError(node.Verify(context.Background(), node.LastAccepted, blk))
 			executedBlk, err := node.Accept(context.Background(), blk)
@@ -428,30 +443,114 @@ func TestNode_AcceptedChunksAvailableOverGetChunk(t *testing.T) {
 
 // Node should be willing to sign valid chunks
 func TestNode_GetChunkSignature_SignValidChunk(t *testing.T) {
+	nodeID := ids.GenerateTestNodeID()
+	sk, err := localsigner.New()
+	require.NoError(t, err)
+	pk := sk.PublicKey()
 	tests := []struct {
-		name     string
-		verifier Verifier[dsmrtest.Tx]
-		wantErr  error
+		name                      string
+		verifier                  Verifier[dsmrtest.Tx]
+		producerNode              ids.NodeID
+		wantErr                   error
+		nodeLastAcceptedTimestamp int64
+		chunkExpiry               int64
 	}{
 		{
-			name:     "invalid chunk",
-			verifier: failVerifier{},
-			wantErr:  ErrInvalidChunk,
+			name:                      "invalid chunk",
+			verifier:                  failVerifier{},
+			wantErr:                   ErrInvalidChunk,
+			producerNode:              ids.GenerateTestNodeID(),
+			nodeLastAcceptedTimestamp: 1,
+			chunkExpiry:               123,
 		},
 		{
-			name:     "valid chunk",
-			verifier: NoVerifier[dsmrtest.Tx]{},
+			name: "invalid chunk ( bad producer id )",
+			verifier: NewChunkVerifier[dsmrtest.Tx](
+				newTestChainState(
+					[]Validator{
+						{
+							NodeID:    nodeID,
+							Weight:    1,
+							PublicKey: pk,
+						},
+					},
+					1,
+					1,
+				),
+				testRuleFactory,
+			),
+			wantErr:                   ErrInvalidChunk,
+			producerNode:              ids.GenerateTestNodeID(),
+			nodeLastAcceptedTimestamp: 1,
+			chunkExpiry:               123,
+		},
+		{
+			name: "invalid chunk ( chunk timestamp too old )",
+			verifier: NewChunkVerifier[dsmrtest.Tx](
+				newTestChainState(
+					[]Validator{
+						{
+							NodeID:    nodeID,
+							Weight:    1,
+							PublicKey: pk,
+						},
+					},
+					1,
+					1,
+				),
+				testRuleFactory,
+			),
+			wantErr:                   ErrInvalidChunk,
+			producerNode:              nodeID,
+			nodeLastAcceptedTimestamp: 5000,
+			chunkExpiry:               123,
+		},
+		{
+			name: "invalid chunk ( chunk timestamp too into the future )",
+			verifier: NewChunkVerifier[dsmrtest.Tx](
+				newTestChainState(
+					[]Validator{
+						{
+							NodeID:    nodeID,
+							Weight:    1,
+							PublicKey: pk,
+						},
+					},
+					1,
+					1,
+				),
+				testRuleFactory,
+			),
+			wantErr:                   ErrInvalidChunk,
+			producerNode:              nodeID,
+			nodeLastAcceptedTimestamp: 1,
+			chunkExpiry:               2 + int64(testingDefaultValidityWindowDuration),
+		},
+		{
+			name:         "valid chunk",
+			producerNode: nodeID,
+			verifier: NewChunkVerifier[dsmrtest.Tx](
+				newTestChainState(
+					[]Validator{
+						{
+							NodeID:    nodeID,
+							Weight:    1,
+							PublicKey: pk,
+						},
+					},
+					1,
+					1,
+				),
+				testRuleFactory,
+			),
+			nodeLastAcceptedTimestamp: 1,
+			chunkExpiry:               123,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := require.New(t)
-
-			nodeID := ids.GenerateTestNodeID()
-			sk, err := bls.NewSecretKey()
-			r.NoError(err)
-			pk := bls.PublicFromSecretKey(sk)
 			signer := warp.NewSigner(sk, networkID, chainID)
 
 			validators := []Validator{
@@ -462,14 +561,15 @@ func TestNode_GetChunkSignature_SignValidChunk(t *testing.T) {
 				},
 			}
 
-			chunkStorage, err := NewChunkStorage[dsmrtest.Tx](tt.verifier, memdb.New())
+			chunkStorage, err := NewChunkStorage[dsmrtest.Tx](tt.verifier, memdb.New(), testRuleFactory)
 			r.NoError(err)
+
+			chainState := newTestChainState(validators, 1, 1)
 
 			node, err := New[dsmrtest.Tx](
 				logging.NoLog{},
 				nodeID,
-				networkID,
-				chainID,
+				chainState,
 				pk,
 				signer,
 				chunkStorage,
@@ -500,7 +600,6 @@ func TestNode_GetChunkSignature_SignValidChunk(t *testing.T) {
 					nodeID,
 					&p2p.NoOpHandler{},
 				),
-				validators,
 				Block{
 					BlockHeader: BlockHeader{
 						ParentID:  ids.GenerateTestID(),
@@ -509,27 +608,37 @@ func TestNode_GetChunkSignature_SignValidChunk(t *testing.T) {
 					},
 					blkID: ids.GenerateTestID(),
 				},
-				1,
-				1,
+				&validitywindowtest.MockTimeValidityWindow[*emapChunkCertificate]{},
+				testRuleFactory,
 			)
 			r.NoError(err)
 
-			chunk, err := newChunk[dsmrtest.Tx](
-				UnsignedChunk[dsmrtest.Tx]{
-					Producer:    ids.GenerateTestNodeID(),
-					Beneficiary: codec.Address{123},
-					Expiry:      123,
-					Txs: []dsmrtest.Tx{
-						{
-							ID:      ids.GenerateTestID(),
-							Expiry:  456,
-							Sponsor: codec.Address{4, 5, 6},
-						},
+			r.NoError(node.BuildChunk(context.Background(), []dsmrtest.Tx{
+				{
+					ID:      ids.GenerateTestID(),
+					Expiry:  456,
+					Sponsor: codec.Address{4, 5, 6},
+				},
+			}, tt.nodeLastAcceptedTimestamp, codec.Address{123}))
+
+			blk, err := node.BuildBlock(context.Background(), node.LastAccepted, tt.nodeLastAcceptedTimestamp)
+			r.NoError(err)
+			_, err = node.Accept(context.Background(), blk)
+			r.NoError(err)
+
+			unsignedChunk := UnsignedChunk[dsmrtest.Tx]{
+				Producer:    tt.producerNode,
+				Beneficiary: codec.Address{123},
+				Expiry:      tt.chunkExpiry,
+				Txs: []dsmrtest.Tx{
+					{
+						ID:      ids.GenerateTestID(),
+						Expiry:  456,
+						Sponsor: codec.Address{4, 5, 6},
 					},
 				},
-				[48]byte{},
-				[96]byte{},
-			)
+			}
+			chunk, err := signChunk[dsmrtest.Tx](unsignedChunk, networkID, chainID, pk, signer)
 			r.NoError(err)
 
 			packer := wrappers.Packer{MaxSize: MaxMessageSize}
@@ -549,41 +658,32 @@ func TestNode_GetChunkSignature_SignValidChunk(t *testing.T) {
 					return
 				}
 
-				pChain := &validatorstest.State{
-					T: t,
-					GetSubnetIDF: func(context.Context, ids.ID) (ids.ID, error) {
-						return ids.Empty, nil
+				chainState := newTestChainState(
+					[]Validator{
+						{
+							NodeID:    node.ID,
+							Weight:    1,
+							PublicKey: node.PublicKey,
+						},
 					},
-					GetValidatorSetF: func(
-						context.Context,
-						uint64,
-						ids.ID,
-					) (map[ids.NodeID]*snowValidators.GetValidatorOutput, error) {
-						return map[ids.NodeID]*snowValidators.GetValidatorOutput{
-							node.ID: {
-								NodeID:    node.ID,
-								PublicKey: node.PublicKey,
-								Weight:    1,
-							},
-						}, nil
-					},
-				}
-
+					1,
+					1,
+				)
 				signature := warp.BitSetSignature{
-					Signers:   getSignerBitSet(t, pChain, node.ID).Bytes(),
+					Signers:   getSignerBitSet(t, chainState, node.ID).Bytes(),
 					Signature: [bls.SignatureLen]byte{},
 				}
 
 				copy(signature.Signature[:], response.Signature)
 
+				canonicalValidatorSet, err := chainState.GetCanonicalValidatorSet(context.Background())
+				r.NoError(err)
 				r.NoError(signature.Verify(
-					context.Background(),
 					msg,
 					networkID,
-					pChain,
-					0,
-					1,
-					1,
+					canonicalValidatorSet,
+					chainState.GetQuorumNum(),
+					chainState.GetQuorumDen(),
 				))
 			}
 
@@ -614,66 +714,6 @@ func TestNode_GetChunkSignature_SignValidChunk(t *testing.T) {
 	}
 }
 
-// Node should not sign duplicate chunks that have already been accepted
-func TestNode_GetChunkSignature_DuplicateChunk(t *testing.T) {
-	r := require.New(t)
-
-	node := newTestNode(t)
-	r.NoError(node.BuildChunk(
-		context.Background(),
-		[]dsmrtest.Tx{{ID: ids.Empty, Expiry: 123}},
-		123,
-		codec.Address{123},
-	))
-	blk, err := node.BuildBlock(node.LastAccepted, node.LastAccepted.Timestamp+1)
-	r.NoError(err)
-	r.NoError(node.Verify(context.Background(), node.LastAccepted, blk))
-	executedBlk, err := node.Accept(context.Background(), blk)
-	r.NoError(err)
-	r.Len(executedBlk.Chunks, 1)
-	chunk := executedBlk.Chunks[0]
-
-	done := make(chan struct{})
-	onResponse := func(_ context.Context, _ ids.NodeID, _ *sdk.SignatureResponse, err error) {
-		defer close(done)
-
-		r.ErrorIs(err, ErrDuplicateChunk)
-	}
-
-	packer := wrappers.Packer{MaxSize: MaxMessageSize}
-	r.NoError(codec.LinearCodec.MarshalInto(ChunkReference{
-		ChunkID:  chunk.id,
-		Producer: chunk.Producer,
-		Expiry:   chunk.Expiry,
-	}, &packer))
-	msg, err := warp.NewUnsignedMessage(networkID, chainID, packer.Bytes)
-	r.NoError(err)
-
-	client := NewGetChunkSignatureClient(
-		networkID,
-		chainID,
-		p2ptest.NewClient(
-			t,
-			context.Background(),
-			ids.EmptyNodeID,
-			p2p.NoOpHandler{},
-			node.ID,
-			node.GetChunkSignatureHandler,
-		),
-	)
-	r.NoError(client.AppRequest(
-		context.Background(),
-		node.ID,
-		&sdk.SignatureRequest{
-			Message:       msg.Bytes(),
-			Justification: chunk.bytes,
-		},
-		onResponse,
-	))
-
-	<-done
-}
-
 // Nodes must persist chunks that they sign from other nodes
 func TestGetChunkSignature_PersistAttestedBlocks(t *testing.T) {
 	r := require.New(t)
@@ -696,7 +736,7 @@ func TestGetChunkSignature_PersistAttestedBlocks(t *testing.T) {
 		err error
 	)
 	for {
-		blk, err = node2.BuildBlock(node2.LastAccepted, node2.LastAccepted.Timestamp+1)
+		blk, err = node2.BuildBlock(context.Background(), node2.LastAccepted, node2.LastAccepted.Timestamp+1)
 		if err == nil {
 			break
 		}
@@ -745,10 +785,11 @@ func TestNode_BuildBlock_IncludesChunks(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		chunks    func(parent Block) []chunk
-		timestamp func(parent Block) int64
-		wantErr   error
+		name               string
+		chunks             func(parent Block) []chunk
+		timestamp          func(parent Block) int64
+		wantErr            error
+		timeValidityWindow TimeValidityWindow[*emapChunkCertificate]
 	}{
 		{
 			name: "no chunk certs",
@@ -914,6 +955,58 @@ func TestNode_BuildBlock_IncludesChunks(t *testing.T) {
 				return parent.Timestamp + 100
 			},
 		},
+		{
+			name: "validity window error",
+			chunks: func(parent Block) []chunk {
+				return []chunk{
+					{
+						txs: []dsmrtest.Tx{
+							{
+								ID:     ids.GenerateTestID(),
+								Expiry: parent.Timestamp + 1_000,
+							},
+						},
+						expiry: parent.Timestamp + 1_000,
+					},
+				}
+			},
+			timestamp: func(parent Block) int64 {
+				return parent.Timestamp + 100
+			},
+			wantErr: errTestingInvalidValidityWindow,
+			timeValidityWindow: &validitywindowtest.MockTimeValidityWindow[*emapChunkCertificate]{
+				OnIsRepeat: func(context.Context, validitywindow.ExecutionBlock[*emapChunkCertificate], []*emapChunkCertificate, int64) (set.Bits, error) {
+					return set.NewBits(), errTestingInvalidValidityWindow
+				},
+			},
+		},
+		{
+			name: "no available chunk certs ( all duplicates )",
+			chunks: func(parent Block) []chunk {
+				return []chunk{
+					{
+						txs: []dsmrtest.Tx{
+							{
+								ID:     ids.GenerateTestID(),
+								Expiry: parent.Timestamp + 1_000,
+							},
+						},
+						expiry: parent.Timestamp + 1_000,
+					},
+				}
+			},
+			timestamp: func(parent Block) int64 {
+				return parent.Timestamp + 100
+			},
+			wantErr: ErrNoAvailableChunkCerts,
+			timeValidityWindow: &validitywindowtest.MockTimeValidityWindow[*emapChunkCertificate]{
+				OnIsRepeat: func(context.Context, validitywindow.ExecutionBlock[*emapChunkCertificate], []*emapChunkCertificate, int64) (set.Bits, error) {
+					marker := set.NewBits()
+					marker.Add(0)
+					return marker, nil
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -945,8 +1038,10 @@ func TestNode_BuildBlock_IncludesChunks(t *testing.T) {
 
 				wantChunks = append(wantChunks, chunk)
 			}
-
-			blk, err := node.BuildBlock(node.LastAccepted, timestamp)
+			if tt.timeValidityWindow != nil {
+				node.validityWindow = tt.timeValidityWindow
+			}
+			blk, err := node.BuildBlock(context.Background(), node.LastAccepted, timestamp)
 			r.ErrorIs(err, tt.wantErr)
 			if err != nil {
 				return
@@ -975,7 +1070,7 @@ func TestAccept_RequestReferencedChunks(t *testing.T) {
 		123,
 		codec.Address{123},
 	))
-	blk, err := node1.BuildBlock(node1.LastAccepted, node1.LastAccepted.Timestamp+1)
+	blk, err := node1.BuildBlock(context.Background(), node1.LastAccepted, node1.LastAccepted.Timestamp+1)
 	r.NoError(err)
 	r.NoError(node1.Verify(context.Background(), node1.LastAccepted, blk))
 	_, err = node1.Accept(context.Background(), blk)
@@ -1014,18 +1109,13 @@ func TestAccept_RequestReferencedChunks(t *testing.T) {
 	<-done
 }
 
-func getSignerBitSet(t *testing.T, pChain snowValidators.State, nodeIDs ...ids.NodeID) set.Bits {
-	validators, _, err := warp.GetCanonicalValidatorSet(
-		context.Background(),
-		pChain,
-		0,
-		ids.Empty,
-	)
+func getSignerBitSet(t *testing.T, chainState ChainState, nodeIDs ...ids.NodeID) set.Bits {
+	validators, err := chainState.GetCanonicalValidatorSet(context.Background())
 	require.NoError(t, err)
 
 	signers := set.Of(nodeIDs...)
 	signerBitSet := set.NewBits()
-	for i, v := range validators {
+	for i, v := range validators.Validators {
 		for _, nodeID := range v.NodeIDs {
 			if signers.Contains(nodeID) {
 				signerBitSet.Add(i)
@@ -1048,16 +1138,17 @@ func Test_Verify(t *testing.T) {
 		codec.Address{123},
 	))
 
-	blk, err := node.BuildBlock(node.LastAccepted, node.LastAccepted.Timestamp+1)
+	blk, err := node.BuildBlock(context.Background(), node.LastAccepted, node.LastAccepted.Timestamp+1)
 	r.NoError(err)
 	r.NoError(node.Verify(context.Background(), node.LastAccepted, blk))
 }
 
 func Test_Verify_BadBlock(t *testing.T) {
 	tests := []struct {
-		name    string
-		blk     func(parent Block) Block
-		wantErr error
+		name           string
+		blk            func(parent Block) Block
+		wantErr        error
+		validityWindow TimeValidityWindow[*emapChunkCertificate]
 	}{
 		{
 			name: "invalid parent",
@@ -1209,6 +1300,25 @@ func Test_Verify_BadBlock(t *testing.T) {
 			},
 			wantErr: ErrInvalidWarpSignature,
 		},
+		{
+			name: "invalid validity window",
+			blk: func(parent Block) Block {
+				return Block{
+					BlockHeader: BlockHeader{
+						ParentID:  parent.GetID(),
+						Height:    parent.Height + 1,
+						Timestamp: parent.Timestamp + 1,
+					},
+					ChunkCerts: parent.ChunkCerts,
+				}
+			},
+			wantErr: errTestingInvalidValidityWindow,
+			validityWindow: &validitywindowtest.MockTimeValidityWindow[*emapChunkCertificate]{
+				OnVerifyExpiryReplayProtection: func(context.Context, validitywindow.ExecutionBlock[*emapChunkCertificate]) error {
+					return errTestingInvalidValidityWindow
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1221,11 +1331,16 @@ func Test_Verify_BadBlock(t *testing.T) {
 				100,
 				codec.Address{123},
 			))
-			blk, err := node.BuildBlock(node.LastAccepted, 100)
+			blk, err := node.BuildBlock(context.Background(), node.LastAccepted, 100)
 			r.NoError(err)
 			_, err = node.Accept(context.Background(), blk)
 			r.NoError(err)
 
+			// optionally replace the node's validity window implementation in order to test
+			// the handling of potential error cases.
+			if tt.validityWindow != nil {
+				node.validityWindow = tt.validityWindow
+			}
 			r.ErrorIs(node.Verify(
 				context.Background(),
 				node.LastAccepted,
@@ -1237,7 +1352,13 @@ func Test_Verify_BadBlock(t *testing.T) {
 
 type failVerifier struct{}
 
+func (failVerifier) SetMin(int64) {}
+
 func (failVerifier) Verify(Chunk[dsmrtest.Tx]) error {
+	return errors.New("fail")
+}
+
+func (failVerifier) VerifyCertificate(context.Context, *ChunkCertificate) error {
 	return errors.New("fail")
 }
 
@@ -1246,7 +1367,7 @@ type testNode struct {
 	GetChunkHandler               p2p.Handler
 	ChunkSignatureRequestHandler  p2p.Handler
 	ChunkCertificateGossipHandler p2p.Handler
-	Sk                            *bls.SecretKey
+	Sk                            *localsigner.LocalSigner
 }
 
 func newTestNode(t *testing.T) *Node[dsmrtest.Tx] {
@@ -1255,21 +1376,35 @@ func newTestNode(t *testing.T) *Node[dsmrtest.Tx] {
 
 func newTestNodes(t *testing.T, n int) []*Node[dsmrtest.Tx] {
 	nodes := make([]testNode, 0, n)
-	validators := make([]Validator, 0, n)
+	validators := make([]Validator, n)
+	secretKeys := make([]*localsigner.LocalSigner, n)
+	var err error
 	for i := 0; i < n; i++ {
-		sk, err := bls.NewSecretKey()
+		secretKeys[i], err = localsigner.New()
 		require.NoError(t, err)
-		pk := bls.PublicFromSecretKey(sk)
-		signer := warp.NewSigner(sk, networkID, chainID)
+		pk := secretKeys[i].PublicKey()
+		validators[i] = Validator{
+			NodeID:    ids.GenerateTestNodeID(),
+			Weight:    1,
+			PublicKey: pk,
+		}
+	}
 
-		chunkStorage, err := NewChunkStorage[dsmrtest.Tx](NoVerifier[dsmrtest.Tx]{}, memdb.New())
+	for i := 0; i < n; i++ {
+		chainState := newTestChainState(validators, 1, 1)
+		signer := warp.NewSigner(secretKeys[i], networkID, chainID)
+		verifier := NewChunkVerifier[dsmrtest.Tx](
+			chainState,
+			testRuleFactory,
+		)
+		chunkStorage, err := NewChunkStorage[dsmrtest.Tx](verifier, memdb.New(), testRuleFactory)
 		require.NoError(t, err)
 
 		getChunkHandler := &GetChunkHandler[dsmrtest.Tx]{
 			storage: chunkStorage,
 		}
 		chunkSignatureRequestHandler := acp118.NewHandler(ChunkSignatureRequestVerifier[dsmrtest.Tx]{
-			verifier: NoVerifier[dsmrtest.Tx]{},
+			verifier: verifier,
 			storage:  chunkStorage,
 		}, signer)
 		chunkCertificateGossipHandler := ChunkCertificateGossipHandler[dsmrtest.Tx]{
@@ -1281,13 +1416,7 @@ func newTestNodes(t *testing.T, n int) []*Node[dsmrtest.Tx] {
 			GetChunkHandler:               getChunkHandler,
 			ChunkSignatureRequestHandler:  chunkSignatureRequestHandler,
 			ChunkCertificateGossipHandler: chunkCertificateGossipHandler,
-			Sk:                            sk,
-		})
-
-		validators = append(validators, Validator{
-			NodeID:    ids.GenerateTestNodeID(),
-			Weight:    1,
-			PublicKey: pk,
+			Sk:                            secretKeys[i],
 		})
 	}
 
@@ -1305,12 +1434,11 @@ func newTestNodes(t *testing.T, n int) []*Node[dsmrtest.Tx] {
 			chunkSignaturePeers[validators[j].NodeID] = nodes[j].ChunkSignatureRequestHandler
 			chunkCertGossipPeers[validators[j].NodeID] = nodes[j].ChunkCertificateGossipHandler
 		}
-
+		chainState := newTestChainState(validators, 1, 1)
 		node, err := New[dsmrtest.Tx](
 			logging.NoLog{},
 			validators[i].NodeID,
-			networkID,
-			chainID,
+			chainState,
 			validators[i].PublicKey,
 			warp.NewSigner(n.Sk, networkID, chainID),
 			n.ChunkStorage,
@@ -1338,10 +1466,9 @@ func newTestNodes(t *testing.T, n int) []*Node[dsmrtest.Tx] {
 				n.ChunkCertificateGossipHandler,
 				chunkCertGossipPeers,
 			),
-			validators,
 			Block{},
-			1,
-			1,
+			&validitywindowtest.MockTimeValidityWindow[*emapChunkCertificate]{},
+			testRuleFactory,
 		)
 		require.NoError(t, err)
 
@@ -1363,7 +1490,7 @@ func newTestNodes(t *testing.T, n int) []*Node[dsmrtest.Tx] {
 		codec.Address{},
 	))
 
-	blk, err := node.BuildBlock(node.LastAccepted, node.LastAccepted.Timestamp+1)
+	blk, err := node.BuildBlock(context.Background(), node.LastAccepted, node.LastAccepted.Timestamp+1)
 	require.NoError(t, err)
 
 	require.NoError(t, node.Verify(context.Background(), node.LastAccepted, blk))
@@ -1378,3 +1505,93 @@ func newTestNodes(t *testing.T, n int) []*Node[dsmrtest.Tx] {
 
 	return result
 }
+
+type testChainState struct {
+	validatorstest.State
+	validators []Validator
+	quorumNum  uint64
+	quorumDen  uint64
+}
+
+func newTestChainState(validatorsSlice []Validator, quorumNum, quorumDen uint64) *testChainState { //nolint:unparam
+	chainState := &testChainState{
+		validators: validatorsSlice,
+		quorumNum:  quorumNum,
+		quorumDen:  quorumDen,
+	}
+	chainState.GetSubnetIDF = func(context.Context, ids.ID) (ids.ID, error) {
+		return chainState.GetSubnetID(), nil
+	}
+	chainState.GetValidatorSetF = func(
+		context.Context,
+		uint64,
+		ids.ID,
+	) (map[ids.NodeID]*validators.GetValidatorOutput, error) {
+		return chainState.getValidatorSet(), nil
+	}
+	return chainState
+}
+
+func (*testChainState) GetNetworkID() uint32 {
+	return networkID
+}
+
+func (*testChainState) GetSubnetID() ids.ID {
+	return ids.Empty
+}
+
+func (*testChainState) GetChainID() ids.ID {
+	return chainID
+}
+
+func (t *testChainState) GetQuorumNum() uint64 {
+	return t.quorumNum
+}
+
+func (t *testChainState) GetQuorumDen() uint64 {
+	return t.quorumDen
+}
+
+func (t *testChainState) getValidatorSet() map[ids.NodeID]*validators.GetValidatorOutput {
+	result := make(map[ids.NodeID]*validators.GetValidatorOutput, len(t.validators))
+	for _, v := range t.validators {
+		result[v.NodeID] = &validators.GetValidatorOutput{
+			NodeID:    v.NodeID,
+			PublicKey: v.PublicKey,
+			Weight:    v.Weight,
+		}
+	}
+	return result
+}
+
+func (t *testChainState) GetCanonicalValidatorSet(ctx context.Context) (warp.CanonicalValidatorSet, error) {
+	return warp.GetCanonicalValidatorSetFromSubnetID(
+		ctx,
+		t,
+		0,
+		ids.Empty,
+	)
+}
+
+func (t *testChainState) IsNodeValidator(_ context.Context, nodeID ids.NodeID, _ uint64) (bool, error) {
+	for _, v := range t.validators {
+		if v.NodeID.Compare(nodeID) == 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+type ruleFactory struct {
+	rules rules
+}
+
+func (r ruleFactory) GetRules(int64) Rules { return r.rules }
+
+type rules struct {
+	validityWindow         int64
+	maxProducerChunkWeight uint64
+}
+
+func (r rules) GetValidityWindow() int64                     { return r.validityWindow }
+func (r rules) GetMaxAccumulatedProducerChunkWeight() uint64 { return r.maxProducerChunkWeight }

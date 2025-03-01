@@ -23,7 +23,7 @@ func createTestIndexer(
 	require := require.New(t)
 
 	tempDir := t.TempDir()
-	indexer, err := NewIndexer(tempDir, chaintest.NewEmptyParser(), uint64(blockWindow))
+	indexer, err := NewIndexer(tempDir, chaintest.NewTestParser(), uint64(blockWindow))
 	require.NoError(err)
 
 	executedBlocks = chaintest.GenerateEmptyExecutedBlocks(
@@ -52,7 +52,7 @@ func checkBlocks(
 	expectedLatestBlk := expectedBlocks[len(expectedBlocks)-1]
 	latestBlk, err := indexer.GetLatestBlock()
 	require.NoError(err)
-	require.Equal(expectedLatestBlk.Block.ID(), latestBlk.Block.ID())
+	require.Equal(expectedLatestBlk.Block.GetID(), latestBlk.Block.GetID())
 
 	// Confirm all blocks in the window are retrievable
 	for i := 0; i < blockWindow; i++ {
@@ -60,11 +60,11 @@ func checkBlocks(
 		height := expectedBlk.Block.Hght
 		blkByHeight, err := indexer.GetBlockByHeight(height)
 		require.NoError(err)
-		require.Equal(expectedBlk.Block.ID(), blkByHeight.Block.ID())
+		require.Equal(expectedBlk.Block.GetID(), blkByHeight.Block.GetID())
 
-		blkByID, err := indexer.GetBlock(expectedBlk.Block.ID())
+		blkByID, err := indexer.GetBlock(expectedBlk.Block.GetID())
 		require.NoError(err)
-		require.Equal(expectedBlk.Block.ID(), blkByID.Block.ID())
+		require.Equal(expectedBlk.Block.GetID(), blkByID.Block.GetID())
 	}
 
 	// Confirm blocks outside the window are not retrievable
@@ -101,14 +101,14 @@ func TestBlockIndexRestart(t *testing.T) {
 	require.NoError(indexer.Close())
 
 	// Confirm we have indexed the expected window of blocks after restart
-	restartedIndexer, err := NewIndexer(indexerDir, chaintest.NewEmptyParser(), uint64(blockWindow))
+	restartedIndexer, err := NewIndexer(indexerDir, chaintest.NewTestParser(), uint64(blockWindow))
 	require.NoError(err)
 	checkBlocks(require, indexer, executedBlocks, blockWindow)
 	require.NoError(restartedIndexer.Close())
 
 	// Confirm we have indexed the expected window of blocks after restart and a window
 	// change
-	restartedIndexerSingleBlockWindow, err := NewIndexer(indexerDir, chaintest.NewEmptyParser(), 1)
+	restartedIndexerSingleBlockWindow, err := NewIndexer(indexerDir, chaintest.NewTestParser(), 1)
 	require.NoError(err)
 	checkBlocks(require, restartedIndexerSingleBlockWindow, executedBlocks, 1)
 	require.NoError(restartedIndexerSingleBlockWindow.Close())

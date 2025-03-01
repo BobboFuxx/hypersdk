@@ -16,15 +16,16 @@ import (
 	"github.com/ava-labs/avalanchego/network/p2p/acp118"
 	"github.com/ava-labs/avalanchego/utils/crypto/bls"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
 	"github.com/ava-labs/avalanchego/vms/platformvm/warp"
 
 	"github.com/ava-labs/hypersdk/codec"
 	"github.com/ava-labs/hypersdk/consts"
+	"github.com/ava-labs/hypersdk/internal/emap"
+	"github.com/ava-labs/hypersdk/internal/validitywindow"
 	"github.com/ava-labs/hypersdk/proto/pb/dsmr"
 	"github.com/ava-labs/hypersdk/utils"
-
-	snowValidators "github.com/ava-labs/avalanchego/snow/validators"
 )
 
 const (
@@ -32,7 +33,7 @@ const (
 )
 
 var (
-	_ snowValidators.State = (*pChain)(nil)
+	_ TimeValidityWindow[*emapChunkCertificate] = (validitywindow.Interface[*emapChunkCertificate])(nil)
 
 	ErrEmptyChunk                          = errors.New("empty chunk")
 	ErrNoAvailableChunkCerts               = errors.New("no available chunk certs")
@@ -46,17 +47,35 @@ var (
 	ErrFailedToReplicate                   = errors.New("failed to replicate to sufficient stake")
 )
 
+type ChainState interface {
+	GetNetworkID() uint32
+	GetSubnetID() ids.ID
+	GetChainID() ids.ID
+	GetCanonicalValidatorSet(ctx context.Context) (validators warp.CanonicalValidatorSet, err error)
+	IsNodeValidator(ctx context.Context, nodeID ids.NodeID, pChainHeight uint64) (bool, error)
+	GetQuorumNum() uint64
+	GetQuorumDen() uint64
+}
+
 type Validator struct {
 	NodeID    ids.NodeID
 	Weight    uint64
 	PublicKey *bls.PublicKey
 }
 
+type Rules interface {
+	GetValidityWindow() int64
+	GetMaxAccumulatedProducerChunkWeight() uint64
+}
+
+type RuleFactory interface {
+	GetRules(t int64) Rules
+}
+
 func New[T Tx](
 	log logging.Logger,
 	nodeID ids.NodeID,
-	networkID uint32,
-	chainID ids.ID,
+	chainState ChainState,
 	pk *bls.PublicKey,
 	signer warp.Signer,
 	chunkStorage *ChunkStorage[T],
@@ -66,29 +85,41 @@ func New[T Tx](
 	getChunkClient *p2p.Client,
 	getChunkSignatureClient *p2p.Client,
 	chunkCertificateGossipClient *p2p.Client,
-	validators []Validator, // TODO remove hard-coded validator set
 	lastAccepted Block,
-	quorumNum uint64,
-	quorumDen uint64,
+	timeValidityWindow TimeValidityWindow[*emapChunkCertificate],
+	ruleFactory RuleFactory,
 ) (*Node[T], error) {
 	return &Node[T]{
 		ID:                            nodeID,
+		chainState:                    chainState,
 		LastAccepted:                  lastAccepted,
-		networkID:                     networkID,
-		chainID:                       chainID,
 		PublicKey:                     pk,
 		Signer:                        signer,
 		getChunkClient:                NewGetChunkClient[T](getChunkClient),
 		chunkCertificateGossipClient:  NewChunkCertificateGossipClient(chunkCertificateGossipClient),
-		validators:                    validators,
-		quorumNum:                     quorumNum,
-		quorumDen:                     quorumDen,
 		chunkSignatureAggregator:      acp118.NewSignatureAggregator(log, getChunkSignatureClient),
 		GetChunkHandler:               getChunkHandler,
 		GetChunkSignatureHandler:      getChunkSignatureHandler,
 		ChunkCertificateGossipHandler: chunkCertificateGossipHandler,
 		storage:                       chunkStorage,
+		log:                           log,
+		validityWindow:                timeValidityWindow,
+		ruleFactory:                   ruleFactory,
 	}, nil
+}
+
+type TimeValidityWindow[T emap.Item] interface {
+	Accept(blk validitywindow.ExecutionBlock[T])
+	VerifyExpiryReplayProtection(
+		ctx context.Context,
+		blk validitywindow.ExecutionBlock[T],
+	) error
+	IsRepeat(
+		ctx context.Context,
+		parentBlk validitywindow.ExecutionBlock[T],
+		currentTimestamp int64,
+		txs []T,
+	) (set.Bits, error)
 }
 
 type Node[T Tx] struct {
@@ -96,19 +127,18 @@ type Node[T Tx] struct {
 	PublicKey                    *bls.PublicKey
 	Signer                       warp.Signer
 	LastAccepted                 Block
-	networkID                    uint32
-	chainID                      ids.ID
+	ruleFactory                  RuleFactory
 	getChunkClient               *TypedClient[*dsmr.GetChunkRequest, Chunk[T], []byte]
 	chunkCertificateGossipClient *TypedClient[[]byte, []byte, *dsmr.ChunkCertificateGossip]
-	validators                   []Validator
-	quorumNum                    uint64
-	quorumDen                    uint64
+	chainState                   ChainState
 	chunkSignatureAggregator     *acp118.SignatureAggregator
 
 	GetChunkHandler               p2p.Handler
 	GetChunkSignatureHandler      p2p.Handler
 	ChunkCertificateGossipHandler p2p.Handler
 	storage                       *ChunkStorage[T]
+	log                           logging.Logger
+	validityWindow                TimeValidityWindow[*emapChunkCertificate]
 }
 
 // BuildChunk builds transactions into a Chunk
@@ -123,6 +153,8 @@ func (n *Node[T]) BuildChunk(
 		return ErrEmptyChunk
 	}
 
+	networkID := n.chainState.GetNetworkID()
+	chainID := n.chainState.GetChainID()
 	chunk, err := signChunk[T](
 		UnsignedChunk[T]{
 			Producer:    n.ID,
@@ -130,8 +162,8 @@ func (n *Node[T]) BuildChunk(
 			Expiry:      expiry,
 			Txs:         txs,
 		},
-		n.networkID,
-		n.chainID,
+		networkID,
+		chainID,
 		n.PublicKey,
 		n.Signer,
 	)
@@ -139,16 +171,29 @@ func (n *Node[T]) BuildChunk(
 		return fmt.Errorf("failed to sign chunk: %w", err)
 	}
 
-	packer := wrappers.Packer{MaxSize: MaxMessageSize}
-	if err := codec.LinearCodec.MarshalInto(ChunkReference{
+	chunkRef := ChunkReference{
 		ChunkID:  chunk.id,
 		Producer: chunk.Producer,
 		Expiry:   chunk.Expiry,
-	}, &packer); err != nil {
+	}
+	duplicates, err := n.validityWindow.IsRepeat(ctx, NewValidityWindowBlock(n.LastAccepted), n.LastAccepted.Timestamp, []*emapChunkCertificate{{ChunkCertificate{ChunkReference: chunkRef}}})
+	if err != nil {
+		return fmt.Errorf("failed to varify repeated chunk certificates : %w", err)
+	}
+	if duplicates.Len() > 0 {
+		// we have duplicates
+		return ErrDuplicateChunk
+	}
+	if err := n.storage.CheckRateLimit(chunk); err != nil {
+		return fmt.Errorf("failed to meet chunk rate limits threshold : %w", err)
+	}
+
+	packer := wrappers.Packer{MaxSize: MaxMessageSize}
+	if err := codec.LinearCodec.MarshalInto(chunkRef, &packer); err != nil {
 		return fmt.Errorf("failed to marshal chunk reference: %w", err)
 	}
 
-	unsignedMsg, err := warp.NewUnsignedMessage(n.networkID, n.chainID, packer.Bytes)
+	unsignedMsg, err := warp.NewUnsignedMessage(networkID, chainID, packer.Bytes)
 	if err != nil {
 		return fmt.Errorf("failed to initialize unsigned warp message: %w", err)
 	}
@@ -162,12 +207,7 @@ func (n *Node[T]) BuildChunk(
 		return fmt.Errorf("failed to initialize warp message: %w", err)
 	}
 
-	canonicalValidators, _, err := warp.GetCanonicalValidatorSet(
-		ctx,
-		pChain{validators: n.validators},
-		0,
-		ids.Empty,
-	)
+	canonicalValidators, err := n.chainState.GetCanonicalValidatorSet(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get canonical validator set: %w", err)
 	}
@@ -176,9 +216,9 @@ func (n *Node[T]) BuildChunk(
 		ctx,
 		msg,
 		chunk.bytes,
-		canonicalValidators,
-		n.quorumNum,
-		n.quorumDen,
+		canonicalValidators.Validators,
+		n.chainState.GetQuorumNum(),
+		n.chainState.GetQuorumDen(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to aggregate signatures: %w", err)
@@ -194,12 +234,8 @@ func (n *Node[T]) BuildChunk(
 	}
 
 	chunkCert := ChunkCertificate{
-		ChunkReference: ChunkReference{
-			ChunkID:  chunk.id,
-			Producer: chunk.Producer,
-			Expiry:   chunk.Expiry,
-		},
-		Signature: bitSetSignature,
+		ChunkReference: chunkRef,
+		Signature:      bitSetSignature,
 	}
 
 	packer = wrappers.Packer{MaxSize: MaxMessageSize}
@@ -217,19 +253,27 @@ func (n *Node[T]) BuildChunk(
 	return n.storage.AddLocalChunkWithCert(chunk, &chunkCert)
 }
 
-func (n *Node[T]) BuildBlock(parent Block, timestamp int64) (Block, error) {
+func (n *Node[T]) BuildBlock(ctx context.Context, parent Block, timestamp int64) (Block, error) {
 	if timestamp <= parent.Timestamp {
 		return Block{}, ErrTimestampNotMonotonicallyIncreasing
 	}
 
-	chunkCerts := n.storage.GatherChunkCerts()
+	gatheredChunkCerts := n.storage.GatherChunkCerts()
+	emapChunkCerts := make([]*emapChunkCertificate, len(gatheredChunkCerts))
+	for i := range emapChunkCerts {
+		emapChunkCerts[i] = &emapChunkCertificate{*gatheredChunkCerts[i]}
+	}
+	duplicates, err := n.validityWindow.IsRepeat(ctx, NewValidityWindowBlock(parent), timestamp, emapChunkCerts)
+	if err != nil {
+		return Block{}, err
+	}
+
 	availableChunkCerts := make([]*ChunkCertificate, 0)
-	for _, chunkCert := range chunkCerts {
-		// avoid building blocks with expired chunk certs
-		if chunkCert.Expiry < timestamp {
+	for i, chunkCert := range gatheredChunkCerts {
+		// avoid building blocks with duplicate or expired chunk certs
+		if chunkCert.Expiry < timestamp || duplicates.Contains(i) {
 			continue
 		}
-
 		availableChunkCerts = append(availableChunkCerts, chunkCert)
 	}
 	if len(availableChunkCerts) == 0 {
@@ -283,15 +327,15 @@ func (n *Node[T]) Verify(ctx context.Context, parent Block, block Block) error {
 		return fmt.Errorf("%w: %s", ErrEmptyBlock, block.GetID())
 	}
 
+	// Find repeats
+	if err := n.validityWindow.VerifyExpiryReplayProtection(ctx, NewValidityWindowBlock(block)); err != nil {
+		return err
+	}
+
 	for _, chunkCert := range block.ChunkCerts {
 		if err := chunkCert.Verify(
 			ctx,
-			n.networkID,
-			n.chainID,
-			pChain{validators: n.validators},
-			0,
-			n.quorumNum,
-			n.quorumDen,
+			n.chainState,
 		); err != nil {
 			return fmt.Errorf("%w %s: %w", ErrInvalidWarpSignature, chunkCert.ChunkID, err)
 		}
@@ -301,13 +345,13 @@ func (n *Node[T]) Verify(ctx context.Context, parent Block, block Block) error {
 }
 
 func (n *Node[T]) Accept(ctx context.Context, block Block) (ExecutedBlock[T], error) {
-	chunkIDs := make([]ids.ID, 0, len(block.ChunkCerts))
+	acceptedChunkIDs := make([]ids.ID, 0, len(block.ChunkCerts))
 	chunks := make([]Chunk[T], 0, len(block.ChunkCerts))
 
 	for _, chunkCert := range block.ChunkCerts {
-		chunkIDs = append(chunkIDs, chunkCert.ChunkID)
+		acceptedChunkIDs = append(acceptedChunkIDs, chunkCert.ChunkID)
 
-		chunkBytes, _, err := n.storage.GetChunkBytes(chunkCert.Expiry, chunkCert.ChunkID)
+		chunkBytes, err := n.storage.GetChunkBytes(chunkCert.Expiry, chunkCert.ChunkID)
 		if errors.Is(err, database.ErrNotFound) {
 			for {
 				result := make(chan error)
@@ -327,7 +371,11 @@ func (n *Node[T]) Accept(ctx context.Context, block Block) (ExecutedBlock[T], er
 				}
 
 				// TODO better request strategy
-				nodeID := n.validators[rand.Intn(len(n.validators))].NodeID //nolint:gosec
+				validators, err := n.chainState.GetCanonicalValidatorSet(ctx)
+				if err != nil {
+					return ExecutedBlock[T]{}, fmt.Errorf("failed to retrieve validators list: %w", err)
+				}
+				nodeID := validators.Validators[rand.Intn(len(validators.Validators))].NodeIDs[0] //nolint:gosec
 				if err := n.getChunkClient.AppRequest(
 					ctx,
 					nodeID,
@@ -353,8 +401,10 @@ func (n *Node[T]) Accept(ctx context.Context, block Block) (ExecutedBlock[T], er
 
 		chunks = append(chunks, chunk)
 	}
+	// update the validity window with the accepted block.
+	n.validityWindow.Accept(NewValidityWindowBlock(block))
 
-	if err := n.storage.SetMin(block.Timestamp, chunkIDs); err != nil {
+	if err := n.storage.SetMin(block.Timestamp, acceptedChunkIDs); err != nil {
 		return ExecutedBlock[T]{}, fmt.Errorf("failed to prune chunks: %w", err)
 	}
 
@@ -368,33 +418,4 @@ func (n *Node[T]) Accept(ctx context.Context, block Block) (ExecutedBlock[T], er
 		ID:     block.GetID(),
 		Chunks: chunks,
 	}, nil
-}
-
-type pChain struct {
-	validators []Validator
-}
-
-func (pChain) GetMinimumHeight(context.Context) (uint64, error) {
-	return 0, nil
-}
-
-func (pChain) GetCurrentHeight(context.Context) (uint64, error) {
-	return 0, nil
-}
-
-func (pChain) GetSubnetID(context.Context, ids.ID) (ids.ID, error) {
-	return ids.Empty, nil
-}
-
-func (p pChain) GetValidatorSet(context.Context, uint64, ids.ID) (map[ids.NodeID]*snowValidators.GetValidatorOutput, error) {
-	result := make(map[ids.NodeID]*snowValidators.GetValidatorOutput, len(p.validators))
-	for _, v := range p.validators {
-		result[v.NodeID] = &snowValidators.GetValidatorOutput{
-			NodeID:    v.NodeID,
-			PublicKey: v.PublicKey,
-			Weight:    v.Weight,
-		}
-	}
-
-	return result, nil
 }

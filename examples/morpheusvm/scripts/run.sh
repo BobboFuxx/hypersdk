@@ -17,25 +17,22 @@ source ../../scripts/constants.sh
 # shellcheck source=/scripts/common/utils.sh
 source ../../scripts/common/utils.sh
 
-VERSION=f03745d187d0c33b927121d4c8da977789b929ac
-
-############################
 # build avalanchego
 # https://github.com/ava-labs/avalanchego/releases
 HYPERSDK_DIR=$HOME/.hypersdk
 
 echo "working directory: $HYPERSDK_DIR"
 
-AVALANCHEGO_PATH=${HYPERSDK_DIR}/avalanchego-${VERSION}/avalanchego
-AVALANCHEGO_PLUGIN_DIR=${HYPERSDK_DIR}/avalanchego-${VERSION}/plugins
+AVALANCHEGO_PATH=${HYPERSDK_DIR}/avalanchego-${AVALANCHE_VERSION}/avalanchego
+AVALANCHEGO_PLUGIN_DIR=${HYPERSDK_DIR}/avalanchego-${AVALANCHE_VERSION}/plugins
 
 if [ ! -f "$AVALANCHEGO_PATH" ]; then
   echo "building avalanchego"
   CWD=$(pwd)
 
   # Clear old folders
-  rm -rf "${HYPERSDK_DIR}"/avalanchego-"${VERSION}"
-  mkdir -p "${HYPERSDK_DIR}"/avalanchego-"${VERSION}"
+  rm -rf "${HYPERSDK_DIR}"/avalanchego-"${AVALANCHE_VERSION}"
+  mkdir -p "${HYPERSDK_DIR}"/avalanchego-"${AVALANCHE_VERSION}"
   rm -rf "${HYPERSDK_DIR}"/avalanchego-src
   mkdir -p "${HYPERSDK_DIR}"/avalanchego-src
 
@@ -43,11 +40,11 @@ if [ ! -f "$AVALANCHEGO_PATH" ]; then
   cd "${HYPERSDK_DIR}"/avalanchego-src
   git clone https://github.com/ava-labs/avalanchego.git
   cd avalanchego
-  git checkout "${VERSION}"
+  git checkout "${AVALANCHE_VERSION}"
 
   # Build avalanchego
   ./scripts/build.sh
-  mv build/avalanchego "${HYPERSDK_DIR}"/avalanchego-"${VERSION}"
+  mv build/avalanchego "${HYPERSDK_DIR}"/avalanchego-"${AVALANCHE_VERSION}"
 
   cd "${CWD}"
 
@@ -62,11 +59,11 @@ fi
 echo "building morpheusvm"
 
 # delete previous (if exists)
-rm -f "${HYPERSDK_DIR}"/avalanchego-"${VERSION}"/plugins/qCNyZHrs3rZX458wPJXPJJypPf6w423A84jnfbdP2TPEmEE9u
+rm -f "${HYPERSDK_DIR}"/avalanchego-"${AVALANCHE_VERSION}"/plugins/qCNyZHrs3rZX458wPJXPJJypPf6w423A84jnfbdP2TPEmEE9u
 
 # rebuild with latest code
 go build \
--o "${HYPERSDK_DIR}"/avalanchego-"${VERSION}"/plugins/qCNyZHrs3rZX458wPJXPJJypPf6w423A84jnfbdP2TPEmEE9u \
+-o "${HYPERSDK_DIR}"/avalanchego-"${AVALANCHE_VERSION}"/plugins/qCNyZHrs3rZX458wPJXPJJypPf6w423A84jnfbdP2TPEmEE9u \
 ./cmd/morpheusvm
 
 ############################
@@ -77,17 +74,20 @@ prepare_ginkgo
 ACK_GINKGO_RC=true ginkgo build ./tests/e2e
 ./tests/e2e/e2e.test --help
 
-additional_args=("$@")
+args=(
+  --ginkgo.v
+  --avalanchego-path="${AVALANCHEGO_PATH}"
+  --plugin-dir="${AVALANCHEGO_PLUGIN_DIR}"
+)
 
 if [[ ${MODE} == "run" ]]; then
   echo "applying ginkgo.focus=Ping and --reuse-network to setup local network"
-  additional_args+=("--ginkgo.focus=Ping")
-  additional_args+=("--reuse-network")
+  args+=("--ginkgo.focus=Ping")
+  args+=("--reuse-network")
 fi
 
+# Append any additional arguments passed by the user
+args+=("$@")
+
 echo "running e2e tests"
-./tests/e2e/e2e.test \
---ginkgo.v \
---avalanchego-path="${AVALANCHEGO_PATH}" \
---plugin-dir="${AVALANCHEGO_PLUGIN_DIR}" \
-"${additional_args[@]}"
+./tests/e2e/e2e.test "${args[@]}"

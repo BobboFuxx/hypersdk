@@ -4,13 +4,12 @@
 package vm
 
 import (
-	"github.com/ava-labs/avalanchego/utils/wrappers"
+	"errors"
 
 	"github.com/ava-labs/hypersdk/auth"
 	"github.com/ava-labs/hypersdk/chain"
 	"github.com/ava-labs/hypersdk/codec"
 	"github.com/ava-labs/hypersdk/examples/morpheusvm/actions"
-	"github.com/ava-labs/hypersdk/examples/morpheusvm/consts"
 	"github.com/ava-labs/hypersdk/examples/morpheusvm/storage"
 	"github.com/ava-labs/hypersdk/genesis"
 	"github.com/ava-labs/hypersdk/state/metadata"
@@ -24,6 +23,8 @@ var (
 	OutputParser *codec.TypeParser[codec.Typed]
 
 	AuthProvider *auth.AuthProvider
+
+	Parser *chain.TxTypeParser
 )
 
 // Setup types
@@ -33,33 +34,37 @@ func init() {
 	OutputParser = codec.NewTypeParser[codec.Typed]()
 	AuthProvider = auth.NewAuthProvider()
 
-	errs := &wrappers.Errs{}
+	if err := auth.WithDefaultPrivateKeyFactories(AuthProvider); err != nil {
+		panic(err)
+	}
 
-	auth.WithDefaultPrivateKeyFactories(AuthProvider, errs)
-
-	errs.Add(
+	if err := errors.Join(
 		// When registering new actions, ALWAYS make sure to append at the end.
 		// Pass nil as second argument if manual marshalling isn't needed (if in doubt, you probably don't)
-		ActionParser.Register(&actions.Transfer{}, nil),
+		ActionParser.Register(&actions.Transfer{}, actions.UnmarshalTransfer),
 
 		// When registering new auth, ALWAYS make sure to append at the end.
 		AuthParser.Register(&auth.ED25519{}, auth.UnmarshalED25519),
 		AuthParser.Register(&auth.SECP256R1{}, auth.UnmarshalSECP256R1),
 		AuthParser.Register(&auth.BLS{}, auth.UnmarshalBLS),
 
-		OutputParser.Register(&actions.TransferResult{}, nil),
-	)
-
-	if errs.Errored() {
-		panic(errs.Err)
+		OutputParser.Register(&actions.TransferResult{}, actions.UnmarshalTransferResult),
+	); err != nil {
+		panic(err)
 	}
+
+	Parser = chain.NewTxTypeParser(ActionParser, AuthParser)
 }
 
-// NewWithOptions returns a VM with the specified options
+// New returns a VM with the specified options
 func New(options ...vm.Option) (*vm.VM, error) {
-	options = append(options, With()) // Add MorpheusVM API
-	return defaultvm.New(
-		consts.Version,
+	factory := NewFactory()
+	return factory.New(options...)
+}
+
+func NewFactory() *vm.Factory {
+	options := append(defaultvm.NewDefaultOptions(), With())
+	return vm.NewFactory(
 		genesis.DefaultGenesisFactory{},
 		&storage.BalanceHandler{},
 		metadata.NewDefaultManager(),

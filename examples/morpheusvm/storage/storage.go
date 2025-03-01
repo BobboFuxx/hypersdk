@@ -141,7 +141,12 @@ func SubBalance(
 ) (uint64, error) {
 	key, bal, ok, err := getBalance(ctx, mu, addr)
 	if !ok {
-		return 0, ErrInvalidBalance
+		return 0, fmt.Errorf("%w: could not subtract (bal=%d, addr=%v, amount=%d",
+			ErrInvalidBalance,
+			0,
+			addr,
+			amount,
+		)
 	}
 	if err != nil {
 		return 0, err
@@ -149,11 +154,12 @@ func SubBalance(
 	nbal, err := smath.Sub(bal, amount)
 	if err != nil {
 		return 0, fmt.Errorf(
-			"%w: could not subtract balance (bal=%d, addr=%v, amount=%d)",
+			"%w: could not subtract balance (bal=%d < amount=%d, gap=%d, addr=%v)",
 			ErrInvalidBalance,
 			bal,
-			addr,
 			amount,
+			amount-bal,
+			addr,
 		)
 	}
 	if nbal == 0 {

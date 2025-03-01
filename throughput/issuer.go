@@ -19,9 +19,10 @@ import (
 )
 
 type issuer struct {
-	i      int
-	uri    string
-	parser chain.Parser
+	i           int
+	uri         string
+	parser      chain.Parser
+	ruleFactory chain.RuleFactory
 
 	// TODO: clean up potential race conditions here.
 	l              sync.Mutex
@@ -32,13 +33,14 @@ type issuer struct {
 
 	// injected from the spammer
 	tracker *tracker
+	wg      *sync.WaitGroup
 }
 
 func (i *issuer) Start(ctx context.Context) {
-	i.tracker.issuerWg.Add(1)
+	i.wg.Add(1)
 	go func() {
 		for {
-			_, wsErr, result, err := i.ws.ListenTx(context.TODO())
+			txID, result, err := i.ws.ListenTx(context.TODO())
 			if err != nil {
 				return
 			}
@@ -46,13 +48,13 @@ func (i *issuer) Start(ctx context.Context) {
 			i.outstandingTxs--
 			i.l.Unlock()
 			i.tracker.inflight.Add(-1)
-			i.tracker.logResult(result, wsErr)
+			i.tracker.logResult(txID, result)
 		}
 	}()
 	go func() {
 		defer func() {
 			_ = i.ws.Close()
-			i.tracker.issuerWg.Done()
+			i.wg.Done()
 		}()
 
 		<-ctx.Done()
@@ -76,7 +78,8 @@ func (i *issuer) Start(ctx context.Context) {
 
 func (i *issuer) Send(ctx context.Context, actions []chain.Action, factory chain.AuthFactory, feePerTx uint64) error {
 	// Construct transaction
-	_, tx, err := i.cli.GenerateTransactionManual(i.parser, actions, factory, feePerTx)
+	rules := i.ruleFactory.GetRules(time.Now().UnixMilli())
+	tx, err := chain.GenerateTransactionManual(rules, actions, factory, feePerTx)
 	if err != nil {
 		utils.Outf("{{orange}}failed to generate tx:{{/}} %v\n", err)
 		return fmt.Errorf("failed to generate tx: %w", err)

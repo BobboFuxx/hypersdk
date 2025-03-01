@@ -182,7 +182,7 @@ func (g *Target[T]) Force(ctx context.Context) error {
 
 			txs = append(txs, next)
 			size += txSize
-			return true, false, nil
+			return true, true, nil
 		},
 	)
 	if mempoolErr != nil {
@@ -284,45 +284,47 @@ func (g *Target[T]) Queue(context.Context) {
 }
 
 // periodically but less aggressively force-regossip the pending
-func (g *Target[T]) Run(client *p2p.Client) {
+func (g *Target[T]) Start(client *p2p.Client) {
 	g.client = client
-	defer close(g.doneGossip)
 
 	// Timer blocks until stopped
 	go g.timer.Dispatch()
+	go func() {
+		defer close(g.doneGossip)
 
-	for {
-		select {
-		case <-g.q:
-			tctx := context.Background()
+		for {
+			select {
+			case <-g.q:
+				tctx := context.Background()
 
-			// Check if we are going to propose if it has been less than
-			// [VerifyTimeout] since the last time we verified a block.
-			if time.Now().UnixMilli()-g.latestVerifiedTimestamp < g.cfg.VerifyTimeout {
-				proposers, err := g.validatorSet.Proposers(
-					tctx,
-					g.cfg.NoGossipBuilderDiff,
-					1,
-				)
-				if err == nil && proposers.Contains(g.validatorSet.NodeID()) {
-					g.Queue(tctx) // requeue later in case peer validator
-					g.log.Debug("not gossiping because soon to propose")
-					continue
-				} else if err != nil {
-					g.log.Warn("unable to determine if will propose soon, gossiping anyways", zap.Error(err))
+				// Check if we are going to propose if it has been less than
+				// [VerifyTimeout] since the last time we verified a block.
+				if time.Now().UnixMilli()-g.latestVerifiedTimestamp < g.cfg.VerifyTimeout {
+					proposers, err := g.validatorSet.Proposers(
+						tctx,
+						g.cfg.NoGossipBuilderDiff,
+						1,
+					)
+					if err == nil && proposers.Contains(g.validatorSet.NodeID()) {
+						g.Queue(tctx) // requeue later in case peer validator
+						g.log.Debug("not gossiping because soon to propose")
+						continue
+					} else if err != nil {
+						g.log.Warn("unable to determine if will propose soon, gossiping anyways", zap.Error(err))
+					}
 				}
-			}
 
-			// Gossip to targeted nodes
-			if err := g.Force(tctx); err != nil {
-				g.log.Warn("gossip txs failed", zap.Error(err))
-				continue
+				// Gossip to targeted nodes
+				if err := g.Force(tctx); err != nil {
+					g.log.Warn("gossip txs failed", zap.Error(err))
+					continue
+				}
+			case <-g.stop:
+				g.log.Info("stopping gossip loop")
+				return
 			}
-		case <-g.stop:
-			g.log.Info("stopping gossip loop")
-			return
 		}
-	}
+	}()
 }
 
 func (g *Target[T]) BlockVerified(t int64) {
@@ -348,13 +350,10 @@ func (g *Target[T]) sendTxs(ctx context.Context, txs []T) error {
 
 	for _, gossipContainer := range gossipContainers {
 		// Marshal gossip
-		b, err := g.serializer.Marshal(gossipContainer.Txs)
-		if err != nil {
-			return err
-		}
+		txBatchBytes := g.serializer.Marshal(gossipContainer.Txs)
 
 		// Send gossip to specified peers
-		if err := g.client.AppGossip(ctx, common.SendConfig{NodeIDs: gossipContainer.NodeIDs}, b); err != nil {
+		if err := g.client.AppGossip(ctx, common.SendConfig{NodeIDs: gossipContainer.NodeIDs}, txBatchBytes); err != nil {
 			return err
 		}
 	}

@@ -54,7 +54,7 @@ func NewManual[T Tx](
 	}, nil
 }
 
-func (g *Manual[T]) Run(client *p2p.Client) {
+func (g *Manual[T]) Start(client *p2p.Client) {
 	g.client = client
 
 	// Only respond to explicitly triggered gossip
@@ -93,11 +93,8 @@ func (g *Manual[T]) Force(ctx context.Context) error {
 	if len(txs) == 0 {
 		return nil
 	}
-	b, err := g.serializer.Marshal(txs)
-	if err != nil {
-		return err
-	}
-	if err := g.client.AppGossip(ctx, common.SendConfig{Validators: 10}, b); err != nil {
+	txBatchBytes := g.serializer.Marshal(txs)
+	if err := g.client.AppGossip(ctx, common.SendConfig{Validators: 10}, txBatchBytes); err != nil {
 		g.log.Warn(
 			"GossipTxs failed",
 			zap.Error(err),

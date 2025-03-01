@@ -12,13 +12,13 @@ import (
 type Accepter struct {
 	tracer         trace.Tracer
 	validityWindow ValidityWindow
-	metrics        *chainMetrics
+	metrics        *ChainMetrics
 }
 
 func NewAccepter(
 	tracer trace.Tracer,
 	validityWindow ValidityWindow,
-	metrics *chainMetrics,
+	metrics *ChainMetrics,
 ) *Accepter {
 	return &Accepter{
 		tracer:         tracer,
@@ -27,12 +27,12 @@ func NewAccepter(
 	}
 }
 
-func (a *Accepter) AcceptBlock(ctx context.Context, blk *ExecutionBlock) error {
+func (a *Accepter) AcceptBlock(ctx context.Context, blk *OutputBlock) error {
 	_, span := a.tracer.Start(ctx, "Chain.AcceptBlock")
 	defer span.End()
 
 	a.metrics.txsAccepted.Add(float64(len(blk.StatelessBlock.Txs)))
 	a.validityWindow.Accept(blk)
 
-	return nil
+	return blk.View.CommitToDB(ctx)
 }

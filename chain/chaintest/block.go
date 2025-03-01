@@ -27,9 +27,10 @@ func GenerateEmptyExecutedBlocks(
 			parentHeight+1+uint64(i),
 			[]*chain.Transaction{},
 			ids.Empty,
+			nil,
 		)
 		require.NoError(err)
-		parentID = statelessBlock.ID()
+		parentID = statelessBlock.GetID()
 
 		blk := chain.NewExecutedBlock(
 			statelessBlock,

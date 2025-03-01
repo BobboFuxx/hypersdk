@@ -5,250 +5,494 @@ package chain_test
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ava-labs/hypersdk/auth"
 	"github.com/ava-labs/hypersdk/chain"
 	"github.com/ava-labs/hypersdk/chain/chaintest"
 	"github.com/ava-labs/hypersdk/codec"
 	"github.com/ava-labs/hypersdk/consts"
-	"github.com/ava-labs/hypersdk/crypto/ed25519"
+	"github.com/ava-labs/hypersdk/genesis"
+	"github.com/ava-labs/hypersdk/internal/fees"
+	"github.com/ava-labs/hypersdk/internal/validitywindow"
 	"github.com/ava-labs/hypersdk/state"
+	"github.com/ava-labs/hypersdk/state/balance"
 	"github.com/ava-labs/hypersdk/utils"
+
+	safemath "github.com/ava-labs/avalanchego/utils/math"
+	externalfees "github.com/ava-labs/hypersdk/fees"
 )
+
+const signedTxHex = "0a3208b0bbcac99732122001020304050607000000000000000000000000000000000000000000000000001987d612000000000012360000000000000000010000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffff1a5c00000000000000000101020300000000000000000000000000000000000000000000000000000000000001020300000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffff"
 
 var (
-	_ chain.Action = (*mockTransferAction)(nil)
-	_ chain.Action = (*action2)(nil)
+	_                chain.BalanceHandler = (*mockBalanceHandler)(nil)
+	preSignedTxBytes []byte
+
+	errMockInsufficientBalance = errors.New("mock insufficient balance error")
 )
 
-type abstractMockAction struct{}
+func init() {
+	txBytes, err := hex.DecodeString(signedTxHex)
+	if err != nil {
+		panic(err)
+	}
+	preSignedTxBytes = txBytes
+}
 
-func (*abstractMockAction) ComputeUnits(chain.Rules) uint64 {
+type mockBalanceHandler struct {
+	canDeductError error
+	deductError    error
+}
+
+func (*mockBalanceHandler) AddBalance(_ context.Context, _ codec.Address, _ state.Mutable, _ uint64) error {
 	panic("unimplemented")
 }
 
-func (*abstractMockAction) Execute(_ context.Context, _ chain.Rules, _ state.Mutable, _ int64, _ codec.Address, _ ids.ID) (codec.Typed, error) {
+func (m *mockBalanceHandler) CanDeduct(_ context.Context, _ codec.Address, _ state.Immutable, _ uint64) error {
+	return m.canDeductError
+}
+
+func (m *mockBalanceHandler) Deduct(_ context.Context, _ codec.Address, _ state.Mutable, _ uint64) error {
+	return m.deductError
+}
+
+func (*mockBalanceHandler) GetBalance(_ context.Context, _ codec.Address, _ state.Immutable) (uint64, error) {
 	panic("unimplemented")
 }
 
-func (*abstractMockAction) StateKeys(_ codec.Address, _ ids.ID) state.Keys {
-	panic("unimplemented")
+func (*mockBalanceHandler) SponsorStateKeys(_ codec.Address) state.Keys {
+	return state.Keys{}
 }
 
-func (*abstractMockAction) ValidRange(chain.Rules) (start int64, end int64) {
-	panic("unimplemented")
-}
+func TestTransactionJSON(t *testing.T) {
+	r := require.New(t)
 
-type mockTransferAction struct {
-	abstractMockAction
-	To    codec.Address `serialize:"true" json:"to"`
-	Value uint64        `serialize:"true" json:"value"`
-	Memo  []byte        `serialize:"true" json:"memo"`
-}
-
-func (*mockTransferAction) GetTypeID() uint8 {
-	return 111
-}
-
-type action2 struct {
-	abstractMockAction
-	A uint64 `serialize:"true" json:"a"`
-	B uint64 `serialize:"true" json:"b"`
-}
-
-func (*action2) GetTypeID() uint8 {
-	return 222
-}
-
-func unmarshalTransfer(p *codec.Packer) (chain.Action, error) {
-	var transfer mockTransferAction
-	err := codec.LinearCodec.UnmarshalFrom(p.Packer, &transfer)
-	return &transfer, err
-}
-
-func unmarshalAction2(p *codec.Packer) (chain.Action, error) {
-	var action action2
-	err := codec.LinearCodec.UnmarshalFrom(p.Packer, &action)
-	return &action, err
-}
-
-func TestJSONMarshalUnmarshal(t *testing.T) {
-	require := require.New(t)
-
-	txData := chain.TransactionData{
-		Base: &chain.Base{
+	txData := chain.NewTxData(
+		chain.Base{
 			Timestamp: 1724315246000,
 			ChainID:   [32]byte{1, 2, 3, 4, 5, 6, 7},
 			MaxFee:    1234567,
 		},
-		Actions: []chain.Action{
-			&mockTransferAction{
-				To:    codec.Address{1, 2, 3, 4},
-				Value: 4,
-				Memo:  []byte("hello"),
-			},
-			&mockTransferAction{
-				To:    codec.Address{4, 5, 6, 7},
-				Value: 123,
-				Memo:  []byte("world"),
-			},
-			&action2{
-				A: 2,
-				B: 4,
-			},
+		[]chain.Action{
+			chaintest.NewDummyTestAction(),
 		},
+	)
+	authFactory := &chaintest.TestAuthFactory{
+		TestAuth: chaintest.NewDummyTestAuth(),
 	}
-	priv, err := ed25519.GeneratePrivateKey()
-	require.NoError(err)
-	factory := auth.NewED25519Factory(priv)
+	parser := chaintest.NewTestParser()
 
-	actionCodec := codec.NewTypeParser[chain.Action]()
-	authCodec := codec.NewTypeParser[chain.Auth]()
-
-	err = actionCodec.Register(&mockTransferAction{}, unmarshalTransfer)
-	require.NoError(err)
-	err = actionCodec.Register(&action2{}, unmarshalAction2)
-	require.NoError(err)
-	err = authCodec.Register(&auth.ED25519{}, auth.UnmarshalED25519)
-	require.NoError(err)
-
-	signedTx, err := txData.Sign(factory)
-	require.NoError(err)
+	signedTx, err := txData.Sign(authFactory)
+	r.NoError(err)
 
 	b, err := json.Marshal(signedTx)
-	require.NoError(err)
+	r.NoError(err)
 
-	parser := chaintest.NewParser(nil, actionCodec, authCodec, nil)
-
-	var txFromJSON chain.Transaction
+	txFromJSON := new(chain.Transaction)
 	err = txFromJSON.UnmarshalJSON(b, parser)
-	require.NoError(err)
-	require.Equal(signedTx.Bytes(), txFromJSON.Bytes())
+	r.NoError(err, "failed to unmarshal tx JSON: %q", string(b))
+	equalTx(r, signedTx, txFromJSON)
 }
 
-// TestMarshalUnmarshal roughly validates that a transaction packs and unpacks correctly
-func TestMarshalUnmarshal(t *testing.T) {
-	require := require.New(t)
+func TestSignTransaction(t *testing.T) {
+	r := require.New(t)
 
-	tx := chain.TransactionData{
-		Base: &chain.Base{
+	txData := chain.NewTxData(
+		chain.Base{
 			Timestamp: 1724315246000,
 			ChainID:   [32]byte{1, 2, 3, 4, 5, 6, 7},
 			MaxFee:    1234567,
 		},
-		Actions: []chain.Action{
-			&mockTransferAction{
-				To:    codec.Address{1, 2, 3, 4},
-				Value: 4,
-				Memo:  []byte("hello"),
-			},
-			&mockTransferAction{
-				To:    codec.Address{4, 5, 6, 7},
-				Value: 123,
-				Memo:  []byte("world"),
-			},
-			&action2{
-				A: 2,
-				B: 4,
-			},
+		[]chain.Action{
+			chaintest.NewDummyTestAction(),
+			chaintest.NewDummyTestAction(),
 		},
+	)
+	authFactory := &chaintest.TestAuthFactory{
+		TestAuth: chaintest.NewDummyTestAuth(),
 	}
+	parser := chaintest.NewTestParser()
 
-	priv, err := ed25519.GeneratePrivateKey()
-	require.NoError(err)
-	factory := auth.NewED25519Factory(priv)
+	txBeforeSignBytes := utils.CopyBytes(txData.UnsignedBytes())
+	signedTx, err := txData.Sign(authFactory)
+	r.NoError(err)
 
-	actionCodec := codec.NewTypeParser[chain.Action]()
-	authCodec := codec.NewTypeParser[chain.Auth]()
+	unsignedTxAfterSignBytes := signedTx.TransactionData.UnsignedBytes()
+	r.Equal(txBeforeSignBytes, unsignedTxAfterSignBytes, "signed unsigned bytes matches original unsigned tx data")
+	r.NoError(signedTx.VerifyAuth(context.Background()))
+	equalTxData(r, txData, signedTx.TransactionData, "signed tx data matches original tx data")
 
-	err = authCodec.Register(&auth.ED25519{}, auth.UnmarshalED25519)
-	require.NoError(err)
-	err = actionCodec.Register(&mockTransferAction{}, unmarshalTransfer)
-	require.NoError(err)
-	err = actionCodec.Register(&action2{}, unmarshalAction2)
-	require.NoError(err)
+	signedTxBytes := signedTx.Bytes()
+	r.Equal(signedTx.GetID(), utils.ToID(signedTxBytes), "signed txID matches expected txID")
 
-	// call UnsignedBytes so that the "unsignedBytes" field would get populated.
-	txBeforeSignBytes, err := tx.UnsignedBytes()
-	require.NoError(err)
+	unsignedTxBytes := signedTx.UnsignedBytes()
+	originalUnsignedTxBytes := txData.UnsignedBytes()
+	r.Equal(originalUnsignedTxBytes, unsignedTxBytes)
 
-	signedTx, err := tx.Sign(factory)
-	require.NoError(err)
-	unsignedTxAfterSignBytes, err := signedTx.TransactionData.UnsignedBytes()
-	require.NoError(err)
-	require.Equal(txBeforeSignBytes, unsignedTxAfterSignBytes)
-	require.NotNil(signedTx.Auth)
-	require.Equal(len(signedTx.Actions), len(tx.Actions))
-	for i, action := range signedTx.Actions {
-		require.Equal(tx.Actions[i], action)
-	}
-	writerPacker := codec.NewWriter(0, consts.NetworkSizeLimit)
-	err = signedTx.Marshal(writerPacker)
-	require.NoError(err)
-	require.Equal(signedTx.GetID(), utils.ToID(writerPacker.Bytes()))
-	require.Equal(signedTx.Bytes(), writerPacker.Bytes())
+	parsedTx, err := chain.UnmarshalTx(signedTxBytes, parser)
+	r.NoError(err)
 
-	unsignedTxBytes, err := signedTx.UnsignedBytes()
-	require.NoError(err)
-	originalUnsignedTxBytes, err := tx.UnsignedBytes()
-	require.NoError(err)
-
-	require.Equal(unsignedTxBytes, originalUnsignedTxBytes)
-	require.Len(unsignedTxBytes, 168)
+	equalTx(r, signedTx, parsedTx)
 }
 
 func TestSignRawActionBytesTx(t *testing.T) {
 	require := require.New(t)
-	tx := chain.TransactionData{
-		Base: &chain.Base{
+
+	txData := chain.NewTxData(
+		chain.Base{
 			Timestamp: 1724315246000,
 			ChainID:   [32]byte{1, 2, 3, 4, 5, 6, 7},
 			MaxFee:    1234567,
 		},
-		Actions: []chain.Action{
-			&mockTransferAction{
-				To:    codec.Address{1, 2, 3, 4},
-				Value: 4,
-				Memo:  []byte("hello"),
+		[]chain.Action{
+			chaintest.NewDummyTestAction(),
+		},
+	)
+
+	factory := &chaintest.TestAuthFactory{
+		TestAuth: chaintest.NewDummyTestAuth(),
+	}
+
+	parser := chaintest.NewTestParser()
+
+	signedTx, err := txData.Sign(factory)
+	require.NoError(err)
+
+	actionsBytes := make([][]byte, 0, len(signedTx.Actions))
+	for _, action := range signedTx.Actions {
+		actionsBytes = append(actionsBytes, action.Bytes())
+	}
+	rawSignedTxBytes, err := chain.SignRawActionBytesTx(txData.Base, actionsBytes, factory)
+	require.NoError(err)
+
+	parseRawSignedTx, err := chain.UnmarshalTx(rawSignedTxBytes, parser)
+	require.NoError(err)
+
+	equalTx(require, signedTx, parseRawSignedTx)
+}
+
+func TestUnmarshalTx(t *testing.T) {
+	r := require.New(t)
+
+	txData := chain.NewTxData(
+		chain.Base{
+			Timestamp: 1724315246000,
+			ChainID:   ids.ID{1, 2, 3, 4, 5, 6, 7},
+			MaxFee:    1234567,
+		},
+		[]chain.Action{
+			chaintest.NewDummyTestAction(),
+		},
+	)
+	authFactory := &chaintest.TestAuthFactory{
+		TestAuth: chaintest.NewDummyTestAuth(),
+	}
+	parser := chaintest.NewTestParser()
+
+	signedTx, err := txData.Sign(authFactory)
+	r.NoError(err)
+
+	signedTxBytes := signedTx.Bytes()
+	parsedTx, err := chain.UnmarshalTx(signedTxBytes, parser)
+	r.NoError(err)
+
+	equalTx(r, signedTx, parsedTx)
+	r.Equal(preSignedTxBytes, signedTxBytes, "expected %x, actual %x", preSignedTxBytes, signedTxBytes)
+}
+
+// go test -benchmem -run=^$ -bench ^BenchmarkUnmarshalTx$ github.com/ava-labs/hypersdk/chain -timeout=15s
+//
+// goos: darwin
+// goarch: arm64
+// pkg: github.com/ava-labs/hypersdk/chain
+// BenchmarkUnmarshalTx-12    	  452396	      3008 ns/op	    2336 B/op	      20 allocs/op
+// PASS
+// ok  	github.com/ava-labs/hypersdk/chain	1.748s
+func BenchmarkUnmarshalTx(b *testing.B) {
+	parser := chaintest.NewTestParser()
+	r := require.New(b)
+	b.ResetTimer()
+	for range b.N {
+		tx, err := chain.UnmarshalTx(preSignedTxBytes, parser)
+		r.NoError(err)
+		r.NotNil(tx)
+	}
+}
+
+func TestEstimateUnits(t *testing.T) {
+	r := require.New(t)
+
+	txData := chain.NewTxData(
+		chain.Base{
+			Timestamp: 1724315246000,
+			ChainID:   ids.ID{1, 2, 3, 4, 5, 6, 7},
+			MaxFee:    1234567,
+		},
+		[]chain.Action{
+			chaintest.NewDummyTestAction(),
+		},
+	)
+	authFactory := &chaintest.TestAuthFactory{
+		TestAuth: chaintest.NewDummyTestAuth(),
+	}
+	signedTx, err := txData.Sign(authFactory)
+	r.NoError(err)
+
+	rules := genesis.NewDefaultRules()
+	balanceHandler := balance.NewPrefixBalanceHandler([]byte{0})
+
+	estimatedUnits, err := chain.EstimateUnits(rules, txData.Actions, authFactory)
+	r.NoError(err)
+
+	actualUnits, err := signedTx.Units(balanceHandler, rules)
+	r.NoError(err)
+	for i := range estimatedUnits {
+		r.LessOrEqual(actualUnits[i], estimatedUnits[i])
+	}
+}
+
+func TestPreExecute(t *testing.T) {
+	testRules := genesis.NewDefaultRules()
+	differentChainID := ids.ID{1}
+
+	tests := []struct {
+		name      string
+		tx        *chain.Transaction
+		timestamp int64
+		err       error
+		fm        *fees.Manager
+		bh        chain.BalanceHandler
+	}{
+		{
+			name: "valid test case",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{},
+				},
+				Auth: chaintest.NewDummyTestAuth(),
 			},
-			&mockTransferAction{
-				To:    codec.Address{4, 5, 6, 7},
-				Value: 123,
-				Memo:  []byte("world"),
+			bh: &mockBalanceHandler{},
+		},
+		{
+			name: "base transaction timestamp misaligned",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{
+						Timestamp: consts.MillisecondsPerSecond + 1,
+					},
+				},
 			},
-			&action2{
-				A: 2,
-				B: 4,
+			err: validitywindow.ErrMisalignedTime,
+		},
+		{
+			name: "base transaction timestamp too far in future (61ms > 60ms)",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{
+						Timestamp: testRules.GetValidityWindow() + consts.MillisecondsPerSecond,
+					},
+				},
 			},
+			err: validitywindow.ErrFutureTimestamp,
+		},
+		{
+			name: "base transaction timestamp expired (1ms < 2ms)",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{
+						Timestamp: consts.MillisecondsPerSecond,
+					},
+				},
+			},
+			timestamp: 2 * consts.MillisecondsPerSecond,
+			err:       validitywindow.ErrTimestampExpired,
+		},
+		{
+			name: "base transaction invalid chain id",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{
+						ChainID:   differentChainID,
+						Timestamp: consts.MillisecondsPerSecond,
+					},
+				},
+			},
+			timestamp: consts.MillisecondsPerSecond,
+			err:       chain.ErrInvalidChainID,
+		},
+		{
+			name: "transaction has too many actions (17 > 16)",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{},
+					Actions: func() []chain.Action {
+						actions := make([]chain.Action, testRules.MaxActionsPerTx+1)
+						for i := 0; i < int(testRules.MaxActionsPerTx)+1; i++ {
+							actions = append(actions, chaintest.NewDummyTestAction())
+						}
+						return actions
+					}(),
+				},
+			},
+			err: chain.ErrTooManyActions,
+		},
+		{
+			name: "action timestamp too early (0ms < 1ms)",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{},
+					Actions: []chain.Action{
+						&chaintest.TestAction{
+							Start: consts.MillisecondsPerSecond,
+							End:   -1,
+						},
+					},
+				},
+			},
+			err: chain.ErrActionNotActivated,
+		},
+		{
+			name: "action timestamp too late (2ms > 1ms)",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{
+						Timestamp: 2 * consts.MillisecondsPerSecond,
+					},
+					Actions: []chain.Action{
+						&chaintest.TestAction{
+							Start: consts.MillisecondsPerSecond,
+							End:   consts.MillisecondsPerSecond,
+						},
+					},
+				},
+			},
+			timestamp: 2 * consts.MillisecondsPerSecond,
+			err:       chain.ErrActionNotActivated,
+		},
+		{
+			name: "auth timestamp too early",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{},
+				},
+				Auth: &chaintest.TestAuth{
+					Start: 1 * consts.MillisecondsPerSecond,
+					End:   -1,
+				},
+			},
+			err: chain.ErrAuthNotActivated,
+		},
+		{
+			name: "auth timestamp too late",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{
+						Timestamp: 2 * consts.MillisecondsPerSecond,
+					},
+				},
+				Auth: &chaintest.TestAuth{
+					Start: -1,
+					End:   1 * consts.MillisecondsPerSecond,
+				},
+			},
+			timestamp: 2 * consts.MillisecondsPerSecond,
+			err:       chain.ErrAuthNotActivated,
+		},
+		{
+			name: "fee overflow",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{},
+					Actions: []chain.Action{
+						chaintest.NewDummyTestAction(),
+					},
+				},
+				Auth: chaintest.NewDummyTestAuth(),
+			},
+			fm: func() *fees.Manager {
+				fm := fees.NewManager([]byte{})
+				for i := 0; i < externalfees.FeeDimensions; i++ {
+					fm.SetUnitPrice(externalfees.Dimension(i), consts.MaxUint64)
+				}
+				return fm
+			}(),
+			bh:  &mockBalanceHandler{},
+			err: safemath.ErrOverflow,
+		},
+		{
+			name: "insufficient balance",
+			tx: &chain.Transaction{
+				TransactionData: chain.TransactionData{
+					Base: chain.Base{},
+					Actions: []chain.Action{
+						chaintest.NewDummyTestAction(),
+					},
+				},
+				Auth: chaintest.NewDummyTestAuth(),
+			},
+			bh: &mockBalanceHandler{
+				canDeductError: errMockInsufficientBalance,
+			},
+			err: errMockInsufficientBalance,
 		},
 	}
 
-	priv, err := ed25519.GeneratePrivateKey()
-	require.NoError(err)
-	factory := auth.NewED25519Factory(priv)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := require.New(t)
+			ctx := context.Background()
 
-	actionCodec := codec.NewTypeParser[chain.Action]()
-	authCodec := codec.NewTypeParser[chain.Auth]()
+			if tt.fm == nil {
+				tt.fm = fees.NewManager([]byte{})
+			}
+			if tt.bh == nil {
+				tt.bh = &mockBalanceHandler{}
+			}
 
-	err = authCodec.Register(&auth.ED25519{}, auth.UnmarshalED25519)
-	require.NoError(err)
-	err = actionCodec.Register(&mockTransferAction{}, unmarshalTransfer)
-	require.NoError(err)
-	err = actionCodec.Register(&action2{}, unmarshalAction2)
-	require.NoError(err)
+			r.ErrorIs(
+				tt.tx.PreExecute(
+					ctx,
+					tt.fm,
+					tt.bh,
+					testRules,
+					nil,
+					tt.timestamp,
+				),
+				tt.err,
+			)
+		})
+	}
+}
 
-	signedTx, err := tx.Sign(factory)
-	require.NoError(err)
+// equalTx confirms that the expected and actual transactions are equal
+//
+// We cannot do a simple equals check here because:
+// 1. AvalancheGo codec does not differentiate nil from empty slice, whereas equals does
+// 2. UnmarshalCanoto does not populate the canotoData size field
+// We check each field individually to confirm parsing produced the same result
+// We can remove this and use a simple equals check after resolving these issues:
+// 1. Fix equals check on unmarshalled canoto values https://github.com/StephenButtolph/canoto/issues/73
+// 2. Add dynamic serialization support to canoto https://github.com/StephenButtolph/canoto/issues/75
+//
+// TODO: replace this at the call site with a simple equals check after fixing the above issues
+func equalTx(r *require.Assertions, expected *chain.Transaction, actual *chain.Transaction) {
+	equalTxData(r, expected.TransactionData, actual.TransactionData)
+	r.Equal(expected.Auth, actual.Auth)
+	r.Equal(expected.Bytes(), actual.Bytes())
+}
 
-	p := codec.NewWriter(0, consts.NetworkSizeLimit)
-	require.NoError(signedTx.Actions.MarshalInto(p))
-	actionsBytes := p.Bytes()
-	rawSignedTxBytes, err := chain.SignRawActionBytesTx(tx.Base, actionsBytes, factory)
-	require.NoError(err)
-	require.Equal(signedTx.Bytes(), rawSignedTxBytes)
+func equalTxData(r *require.Assertions, expected chain.TransactionData, actual chain.TransactionData, msgAndArgs ...interface{}) {
+	r.Equal(expected.Base.MarshalCanoto(), actual.Base.MarshalCanoto(), msgAndArgs...)
+	r.Equal(len(expected.Actions), len(actual.Actions), msgAndArgs...)
+	for i, action := range expected.Actions {
+		msgAndArgs = append(msgAndArgs, "index", i)
+		r.Equal(action.Bytes(), actual.Actions[i].Bytes(), msgAndArgs...)
+	}
+	r.Equal(expected.UnsignedBytes(), actual.UnsignedBytes(), msgAndArgs...)
 }

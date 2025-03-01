@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -59,13 +60,13 @@ type Spammer struct {
 	numAccounts int
 
 	// keep track of variables shared across issuers
-	tracker *tracker
+	tracker  *tracker
+	issuerWg *sync.WaitGroup
 }
 
 func NewSpammer(sc *Config, sh SpamHelper) (*Spammer, error) {
 	// Log Zipf participants
 	zipfSeed := rand.New(rand.NewSource(0)) //nolint:gosec
-	tracker := &tracker{}
 	balance, err := sh.LookupBalance(sc.authFactory.Address())
 	if err != nil {
 		return nil, err
@@ -85,7 +86,8 @@ func NewSpammer(sc *Config, sh SpamHelper) (*Spammer, error) {
 		numClients:       sc.numClients,
 		numAccounts:      sc.numAccounts,
 
-		tracker: tracker,
+		tracker:  newTracker(),
+		issuerWg: &sync.WaitGroup{},
 	}, nil
 }
 
@@ -104,13 +106,14 @@ func (s *Spammer) Spam(ctx context.Context, sh SpamHelper, terminate bool, symbo
 	cli := jsonrpc.NewJSONRPCClient(s.uris[0])
 
 	// Compute max units
-	parser, err := sh.GetParser(ctx)
+	parser := sh.GetParser()
+	ruleFactory, err := sh.GetRuleFactory(ctx)
 	if err != nil {
 		return err
 	}
 
 	actions := sh.GetTransfer(s.authFactory.Address(), 0, []byte{})
-	maxUnits, err := chain.EstimateUnits(parser.Rules(time.Now().UnixMilli()), actions, s.authFactory)
+	maxUnits, err := chain.EstimateUnits(ruleFactory.GetRules(time.Now().UnixMilli()), actions, s.authFactory)
 	if err != nil {
 		return err
 	}
@@ -125,13 +128,13 @@ func (s *Spammer) Spam(ctx context.Context, sh SpamHelper, terminate bool, symbo
 	}
 
 	// distribute funds
-	accounts, factories, err := s.distributeFunds(ctx, cli, parser, feePerTx, sh)
+	accounts, factories, err := s.distributeFunds(ctx, feePerTx, sh)
 	if err != nil {
 		return err
 	}
 
 	// create issuers
-	issuers, err := s.createIssuers(parser)
+	issuers, err := s.createIssuers(parser, ruleFactory)
 	if err != nil {
 		return err
 	}
@@ -143,25 +146,27 @@ func (s *Spammer) Spam(ctx context.Context, sh SpamHelper, terminate bool, symbo
 		issuer.Start(cctx)
 	}
 
-	// set logging
-	s.tracker.logState(cctx, issuers[0].cli)
+	// start logging
+	s.tracker.startPeriodicLog(ctx, cli)
 
 	// broadcast transactions
 	err = s.broadcast(cctx, sh, factories, issuers, feePerTx, terminate)
 	cancel()
 	if err != nil {
+		s.tracker.stop()
 		return err
 	}
 
 	// Wait for all issuers to finish
 	utils.Outf("{{yellow}}waiting for issuers to return{{/}}\n")
-	s.tracker.issuerWg.Wait()
+	s.issuerWg.Wait()
+	s.tracker.stop()
 
-	maxUnits, err = chain.EstimateUnits(parser.Rules(time.Now().UnixMilli()), actions, s.authFactory)
+	maxUnits, err = chain.EstimateUnits(ruleFactory.GetRules(time.Now().UnixMilli()), actions, s.authFactory)
 	if err != nil {
 		return err
 	}
-	return s.returnFunds(ctx, cli, parser, maxUnits, sh, accounts, factories, symbol)
+	return s.returnFunds(ctx, cli, maxUnits, sh, accounts, factories, symbol)
 }
 
 func (s Spammer) broadcast(
@@ -223,7 +228,7 @@ func (s Spammer) broadcast(
 					factory := factories[senderIndex]
 					// Send transaction
 					actions := sh.GetActions()
-					s.tracker.IncrementSent()
+					s.tracker.incrementSent()
 					// assumes the sender has the funds to pay for the transaction
 					return issuer.Send(ctx, actions, factory, feePerTx)
 				})
@@ -275,7 +280,7 @@ func (s *Spammer) logZipf(zipfSeed *rand.Rand) {
 }
 
 // createIssuers creates an [numClients] transaction issuers for each URI in [uris]
-func (s *Spammer) createIssuers(parser chain.Parser) ([]*issuer, error) {
+func (s *Spammer) createIssuers(parser chain.Parser, ruleFactory chain.RuleFactory) ([]*issuer, error) {
 	issuers := []*issuer{}
 
 	for i := 0; i < len(s.uris); i++ {
@@ -286,12 +291,14 @@ func (s *Spammer) createIssuers(parser chain.Parser) ([]*issuer, error) {
 				return nil, err
 			}
 			issuer := &issuer{
-				i:       len(issuers),
-				cli:     cli,
-				ws:      webSocketClient,
-				parser:  parser,
-				uri:     s.uris[i],
-				tracker: s.tracker,
+				i:           len(issuers),
+				cli:         cli,
+				ws:          webSocketClient,
+				parser:      parser,
+				ruleFactory: ruleFactory,
+				uri:         s.uris[i],
+				tracker:     s.tracker,
+				wg:          s.issuerWg,
 			}
 			issuers = append(issuers, issuer)
 		}
@@ -299,11 +306,16 @@ func (s *Spammer) createIssuers(parser chain.Parser) ([]*issuer, error) {
 	return issuers, nil
 }
 
-func (s *Spammer) distributeFunds(ctx context.Context, cli *jsonrpc.JSONRPCClient, parser chain.Parser, feePerTx uint64, sh SpamHelper) ([]*auth.PrivateKey, []chain.AuthFactory, error) {
+func (s *Spammer) distributeFunds(ctx context.Context, feePerTx uint64, sh SpamHelper) ([]*auth.PrivateKey, []chain.AuthFactory, error) {
 	withholding := feePerTx * uint64(s.numAccounts)
 	if s.balance < withholding {
 		return nil, nil, fmt.Errorf("insufficient funds (have=%d need=%d)", s.balance, withholding)
 	}
+	ruleFactory, err := sh.GetRuleFactory(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	rules := ruleFactory.GetRules(time.Now().UnixMilli())
 
 	distAmount := (s.balance - withholding) / uint64(s.numAccounts)
 
@@ -336,7 +348,7 @@ func (s *Spammer) distributeFunds(ctx context.Context, cli *jsonrpc.JSONRPCClien
 
 		// Send funds
 		actions := sh.GetTransfer(pk.Address, distAmount, []byte{})
-		_, tx, err := cli.GenerateTransactionManual(parser, actions, s.authFactory, feePerTx)
+		tx, err := chain.GenerateTransactionManual(rules, actions, s.authFactory, feePerTx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -358,7 +370,7 @@ func (s *Spammer) distributeFunds(ctx context.Context, cli *jsonrpc.JSONRPCClien
 	return accounts, factories, nil
 }
 
-func (s *Spammer) returnFunds(ctx context.Context, cli *jsonrpc.JSONRPCClient, parser chain.Parser, maxUnits fees.Dimensions, sh SpamHelper, accounts []*auth.PrivateKey, factories []chain.AuthFactory, symbol string) error {
+func (s *Spammer) returnFunds(ctx context.Context, cli *jsonrpc.JSONRPCClient, maxUnits fees.Dimensions, sh SpamHelper, accounts []*auth.PrivateKey, factories []chain.AuthFactory, symbol string) error {
 	// Return funds
 	unitPrices, err := cli.UnitPrices(ctx, false)
 	if err != nil {
@@ -375,6 +387,11 @@ func (s *Spammer) returnFunds(ctx context.Context, cli *jsonrpc.JSONRPCClient, p
 	if err != nil {
 		return err
 	}
+	ruleFactory, err := sh.GetRuleFactory(ctx)
+	if err != nil {
+		return err
+	}
+	rules := ruleFactory.GetRules(time.Now().UnixMilli())
 	p := &pacer{ws: webSocketClient}
 	go p.Run(ctx, s.minTxsPerSecond)
 	// TODO: we sleep here because occasionally the pacer will hang. Potentially due to
@@ -393,7 +410,7 @@ func (s *Spammer) returnFunds(ctx context.Context, cli *jsonrpc.JSONRPCClient, p
 		// Send funds
 		returnAmt := balance - feePerTx
 		actions := sh.GetTransfer(s.authFactory.Address(), returnAmt, []byte{})
-		_, tx, err := cli.GenerateTransactionManual(parser, actions, factories[i], feePerTx)
+		tx, err := chain.GenerateTransactionManual(rules, actions, factories[i], feePerTx)
 		if err != nil {
 			return err
 		}

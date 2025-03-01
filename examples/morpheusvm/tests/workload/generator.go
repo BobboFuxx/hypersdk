@@ -40,20 +40,25 @@ func (g *TxGenerator) GenerateTx(ctx context.Context, uri string) (*chain.Transa
 	// TODO: no need to generate the clients every tx
 	cli := jsonrpc.NewJSONRPCClient(uri)
 	lcli := vm.NewJSONRPCClient(uri)
-
 	to, err := ed25519.GeneratePrivateKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	ruleFactory, err := lcli.GetRuleFactory(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	toAddress := auth.NewED25519Address(to.PublicKey())
-	parser, err := lcli.Parser(ctx)
+
+	unitPrices, err := cli.UnitPrices(ctx, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	_, tx, _, err := cli.GenerateTransaction(
-		ctx,
-		parser,
+
+	tx, err := chain.GenerateTransaction(
+		ruleFactory,
+		unitPrices,
 		[]chain.Action{&actions.Transfer{
 			To:    toAddress,
 			Value: 1,
@@ -85,8 +90,7 @@ func confirmTx(ctx context.Context, require *require.Assertions, uri string, txI
 	require.Len(txRes.Outputs, 1)
 	transferOutputBytes := []byte(txRes.Outputs[0])
 	require.Equal(consts.TransferID, transferOutputBytes[0])
-	reader := codec.NewReader(transferOutputBytes, len(transferOutputBytes))
-	transferOutputTyped, err := vm.OutputParser.Unmarshal(reader)
+	transferOutputTyped, err := vm.OutputParser.Unmarshal(transferOutputBytes)
 	require.NoError(err)
 	transferOutput, ok := transferOutputTyped.(*actions.TransferResult)
 	require.True(ok)

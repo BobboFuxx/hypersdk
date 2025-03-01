@@ -6,25 +6,22 @@ package chain
 import (
 	"context"
 
+	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
 	"github.com/ava-labs/avalanchego/trace"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/x/merkledb"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/ava-labs/hypersdk/internal/validitywindow"
 	"github.com/ava-labs/hypersdk/internal/workers"
 	"github.com/ava-labs/hypersdk/state"
 )
 
-// create a type alias for the concrete TimeWindowWindow type.
-type ValidityWindow = *validitywindow.TimeValidityWindow[*Transaction]
-
 type Chain struct {
 	builder     *Builder
 	processor   *Processor
-	accepter    *Accepter
 	preExecutor *PreExecutor
 	blockParser *BlockParser
+	accepter    *Accepter
 }
 
 func NewChain(
@@ -41,7 +38,7 @@ func NewChain(
 	validityWindow ValidityWindow,
 	config Config,
 ) (*Chain, error) {
-	metrics, err := newMetrics(registerer)
+	metrics, err := NewMetrics(registerer)
 	if err != nil {
 		return nil, err
 	}
@@ -69,11 +66,6 @@ func NewChain(
 			metrics,
 			config,
 		),
-		accepter: NewAccepter(
-			tracer,
-			validityWindow,
-			metrics,
-		),
 		preExecutor: NewPreExecutor(
 			ruleFactory,
 			validityWindow,
@@ -81,42 +73,36 @@ func NewChain(
 			balanceHandler,
 		),
 		blockParser: NewBlockParser(tracer, parser),
+		accepter:    NewAccepter(tracer, validityWindow, metrics),
 	}, nil
 }
 
-func (c *Chain) BuildBlock(ctx context.Context, parentView state.View, parent *ExecutionBlock) (*ExecutionBlock, *ExecutedBlock, merkledb.View, error) {
-	return c.builder.BuildBlock(ctx, parentView, parent)
+func (c *Chain) BuildBlock(ctx context.Context, pChainCtx *block.Context, parentOutputBlock *OutputBlock) (*ExecutionBlock, *OutputBlock, error) {
+	return c.builder.BuildBlock(ctx, pChainCtx, parentOutputBlock)
 }
 
 func (c *Chain) Execute(
 	ctx context.Context,
-	parentView state.View,
+	parentView merkledb.View,
 	b *ExecutionBlock,
-) (*ExecutedBlock, merkledb.View, error) {
-	return c.processor.Execute(ctx, parentView, b)
-}
-
-func (c *Chain) AsyncVerify(
-	ctx context.Context,
-	b *ExecutionBlock,
-) error {
-	return c.processor.AsyncVerify(ctx, b)
-}
-
-func (c *Chain) AcceptBlock(ctx context.Context, blk *ExecutionBlock) error {
-	return c.accepter.AcceptBlock(ctx, blk)
+	isNormalOp bool,
+) (*OutputBlock, error) {
+	return c.processor.Execute(ctx, parentView, b, isNormalOp)
 }
 
 func (c *Chain) PreExecute(
 	ctx context.Context,
 	parentBlk *ExecutionBlock,
-	view state.View,
+	im state.Immutable,
 	tx *Transaction,
-	verifyAuth bool,
 ) error {
-	return c.preExecutor.PreExecute(ctx, parentBlk, view, tx, verifyAuth)
+	return c.preExecutor.PreExecute(ctx, parentBlk, im, tx)
 }
 
 func (c *Chain) ParseBlock(ctx context.Context, bytes []byte) (*ExecutionBlock, error) {
 	return c.blockParser.ParseBlock(ctx, bytes)
+}
+
+func (c *Chain) AcceptBlock(ctx context.Context, block *OutputBlock) error {
+	return c.accepter.AcceptBlock(ctx, block)
 }

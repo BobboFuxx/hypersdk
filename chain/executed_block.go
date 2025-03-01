@@ -6,84 +6,51 @@ package chain
 import (
 	"fmt"
 
-	"github.com/ava-labs/hypersdk/codec"
-	"github.com/ava-labs/hypersdk/consts"
+	"github.com/StephenButtolph/canoto"
+
 	"github.com/ava-labs/hypersdk/fees"
 )
 
+// ExecutedBlock includes the block and its execution results.
+// This type is used internally to the node and never sent/received
+// over the wire, so it is not subject to the network max message size
+// limitations and it is not necessary to check that the fields are
+// non-nil because we will always populate them with non-nil values.
 type ExecutedBlock struct {
-	Block         *StatelessBlock `json:"block"`
-	Results       []*Result       `json:"results"`
-	UnitPrices    fees.Dimensions `json:"unitPrices"`
-	UnitsConsumed fees.Dimensions `json:"unitsConsumed"`
+	Block            *StatelessBlock   `canoto:"pointer,1" json:"block"`
+	ExecutionResults *ExecutionResults `canoto:"pointer,2" json:"results"`
+
+	canotoData canotoData_ExecutedBlock
 }
 
 func NewExecutedBlock(statelessBlock *StatelessBlock, results []*Result, unitPrices fees.Dimensions, unitsConsumed fees.Dimensions) *ExecutedBlock {
 	return &ExecutedBlock{
-		Block:         statelessBlock,
-		Results:       results,
-		UnitPrices:    unitPrices,
-		UnitsConsumed: unitsConsumed,
+		Block: statelessBlock,
+		ExecutionResults: &ExecutionResults{
+			Results:       results,
+			UnitPrices:    unitPrices,
+			UnitsConsumed: unitsConsumed,
+		},
 	}
 }
 
 func (e *ExecutedBlock) Marshal() ([]byte, error) {
-	blockBytes, err := e.Block.Marshal()
-	if err != nil {
-		return nil, err
-	}
-
-	size := codec.BytesLen(blockBytes) + codec.CummSize(e.Results) + fees.DimensionsLen
-	writer := codec.NewWriter(size, consts.MaxInt)
-
-	writer.PackBytes(blockBytes)
-	resultBytes, err := MarshalResults(e.Results)
-	if err != nil {
-		return nil, err
-	}
-	writer.PackBytes(resultBytes)
-	writer.PackFixedBytes(e.UnitPrices.Bytes())
-	writer.PackFixedBytes(e.UnitsConsumed.Bytes())
-
-	return writer.Bytes(), writer.Err()
+	return e.MarshalCanoto(), nil
 }
 
 func UnmarshalExecutedBlock(bytes []byte, parser Parser) (*ExecutedBlock, error) {
-	reader := codec.NewReader(bytes, consts.NetworkSizeLimit)
-
-	var blkMsg []byte
-	reader.UnpackBytes(-1, true, &blkMsg)
-	blk, err := UnmarshalBlock(blkMsg, parser)
-	if err != nil {
+	r := canoto.Reader{
+		B:       bytes,
+		Context: parser,
+	}
+	b := new(ExecutedBlock)
+	if err := b.UnmarshalCanotoFrom(r); err != nil {
 		return nil, err
 	}
-	var resultsMsg []byte
-	reader.UnpackBytes(-1, true, &resultsMsg)
-	results, err := UnmarshalResults(resultsMsg)
-	if err != nil {
-		return nil, err
-	}
-	unitPricesBytes := make([]byte, fees.DimensionsLen)
-	reader.UnpackFixedBytes(fees.DimensionsLen, &unitPricesBytes)
-	prices, err := fees.UnpackDimensions(unitPricesBytes)
-	if err != nil {
-		return nil, err
-	}
-	consumedBytes := make([]byte, fees.DimensionsLen)
-	reader.UnpackFixedBytes(fees.DimensionsLen, &consumedBytes)
-	consumed, err := fees.UnpackDimensions(consumedBytes)
-	if err != nil {
-		return nil, err
-	}
-	if !reader.Empty() {
-		return nil, ErrInvalidObject
-	}
-	if err := reader.Err(); err != nil {
-		return nil, err
-	}
-	return NewExecutedBlock(blk, results, prices, consumed), nil
+	b.CalculateCanotoCache()
+	return b, nil
 }
 
 func (e *ExecutedBlock) String() string {
-	return fmt.Sprintf("(Block=%s, UnitPrices=%s, UnitsConsumed=%s)", e.Block, e.UnitPrices, e.UnitsConsumed)
+	return fmt.Sprintf("(Block=%s, UnitPrices=%s, UnitsConsumed=%s)", e.Block, e.ExecutionResults.UnitPrices, e.ExecutionResults.UnitsConsumed)
 }

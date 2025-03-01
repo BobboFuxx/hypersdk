@@ -4,7 +4,9 @@
 package dsmr
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -14,6 +16,7 @@ import (
 
 	"github.com/ava-labs/hypersdk/consts"
 	"github.com/ava-labs/hypersdk/internal/emap"
+	"github.com/ava-labs/hypersdk/internal/validitywindow"
 )
 
 const (
@@ -23,28 +26,79 @@ const (
 
 	minSlotByte byte = 0x00
 
-	chunkKeySize = 1 + consts.Uint64Len + ids.IDLen
+	chunkKeySize                         = 1 + consts.Uint64Len + ids.IDLen
+	validityWindowTimestampDivisor int64 = 1 // TODO: make this divisor configurable
 )
 
 var minSlotKey []byte = []byte{metadataByte, minSlotByte}
 
+var (
+	ErrChunkProducerNotValidator = errors.New("chunk producer is not in the validator set")
+	ErrInvalidChunkCertificate   = errors.New("invalid chunk certificate")
+	ErrChunkRateLimitSurpassed   = errors.New("chunk rate limit surpassed")
+)
+
 type Verifier[T Tx] interface {
 	Verify(chunk Chunk[T]) error
+	SetMin(min int64)
+	VerifyCertificate(ctx context.Context, chunkCert *ChunkCertificate) error
 }
 
-var _ Verifier[Tx] = (*NoVerifier[Tx])(nil)
+var _ Verifier[Tx] = (*ChunkVerifier[Tx])(nil)
 
-type NoVerifier[T Tx] struct{}
+type ChunkVerifier[T Tx] struct {
+	chainState  ChainState
+	min         int64
+	ruleFactory RuleFactory
+}
 
-func (NoVerifier[T]) Verify(Chunk[T]) error {
+func NewChunkVerifier[T Tx](chainState ChainState, ruleFactory RuleFactory) *ChunkVerifier[T] {
+	verifier := &ChunkVerifier[T]{
+		chainState:  chainState,
+		ruleFactory: ruleFactory,
+	}
+	return verifier
+}
+
+func (c *ChunkVerifier[T]) SetMin(min int64) {
+	c.min = min
+}
+
+func (c ChunkVerifier[T]) Verify(chunk Chunk[T]) error {
+	// check if the expiry of this chunk isn't in the past or too far into the future.
+	rules := c.ruleFactory.GetRules(c.min)
+	validityWindowDuration := rules.GetValidityWindow()
+	if err := validitywindow.VerifyTimestamp(chunk.Expiry, c.min, validityWindowTimestampDivisor, validityWindowDuration); err != nil {
+		return err
+	}
+
+	// check if the producer was expected to produce this chunk.
+	isValidator, err := c.chainState.IsNodeValidator(context.TODO(), chunk.UnsignedChunk.Producer, 0)
+	if err != nil {
+		return fmt.Errorf("%w: failed to test whether a node belongs to the validator set during chunk verification", err)
+	}
+	if !isValidator {
+		// the producer of this chunk isn't in the validator set.
+		return fmt.Errorf("%w: producer node id %v", ErrChunkProducerNotValidator, chunk.UnsignedChunk.Producer)
+	}
+
+	return chunk.Verify(c.chainState.GetNetworkID(), c.chainState.GetChainID())
+}
+
+func (c ChunkVerifier[T]) VerifyCertificate(ctx context.Context, chunkCert *ChunkCertificate) error {
+	err := chunkCert.Verify(
+		ctx,
+		c.chainState,
+	)
+	if err != nil {
+		return fmt.Errorf("unable to verify chunk certificate: %w", err)
+	}
 	return nil
 }
 
 type StoredChunkSignature[T Tx] struct {
 	Chunk Chunk[T]
 	Cert  *ChunkCertificate
-	// TODO what do we need this flag for?
-	Available bool
 }
 
 // ChunkStorage provides chunk, signature share, and chunk certificate storage
@@ -68,12 +122,18 @@ type ChunkStorage[T Tx] struct {
 
 	// TODO do we need caching
 	// Chunk + signature + cert
-	chunkMap map[ids.ID]*StoredChunkSignature[T]
+	pendingChunkMap map[ids.ID]*StoredChunkSignature[T]
+
+	// pendingChunksSizes map a chunk producer to the total size of storage being used for it's pending chunks.
+	pendingChunksSizes map[ids.NodeID]uint64
+
+	ruleFactory RuleFactory
 }
 
 func NewChunkStorage[T Tx](
 	verifier Verifier[T],
 	db database.Database,
+	ruleFactory RuleFactory,
 ) (*ChunkStorage[T], error) {
 	minSlot := int64(0)
 	minSlotBytes, err := db.Get(minSlotKey)
@@ -90,11 +150,13 @@ func NewChunkStorage[T Tx](
 	}
 
 	storage := &ChunkStorage[T]{
-		minimumExpiry: minSlot,
-		chunkEMap:     emap.NewEMap[emapChunk[T]](),
-		chunkMap:      make(map[ids.ID]*StoredChunkSignature[T]),
-		chunkDB:       db,
-		verifier:      verifier,
+		minimumExpiry:      minSlot,
+		chunkEMap:          emap.NewEMap[emapChunk[T]](),
+		pendingChunkMap:    make(map[ids.ID]*StoredChunkSignature[T]),
+		pendingChunksSizes: make(map[ids.NodeID]uint64),
+		chunkDB:            db,
+		verifier:           verifier,
+		ruleFactory:        ruleFactory,
 	}
 	return storage, storage.init()
 }
@@ -112,10 +174,10 @@ func (s *ChunkStorage[T]) init() error {
 			}
 			return fmt.Errorf("failed to parse chunk %s at slot %d", chunkID, slot)
 		}
-		_, err = s.VerifyRemoteChunk(chunk)
-		if err != nil {
-			return err
-		}
+		s.chunkEMap.Add([]emapChunk[T]{{chunk: chunk}})
+		storedChunkSig := &StoredChunkSignature[T]{Chunk: chunk}
+		s.pendingChunkMap[chunk.id] = storedChunkSig
+		s.pendingChunksSizes[chunk.Producer] += uint64(len(chunk.bytes))
 	}
 
 	if err := iter.Error(); err != nil {
@@ -125,6 +187,7 @@ func (s *ChunkStorage[T]) init() error {
 }
 
 // AddLocalChunkWithCert adds a chunk to storage with the local signature share and aggregated certificate
+// Assumes caller has already verified this does not add a duplicate chunk
 func (s *ChunkStorage[T]) AddLocalChunkWithCert(c Chunk[T], cert *ChunkCertificate) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -133,14 +196,18 @@ func (s *ChunkStorage[T]) AddLocalChunkWithCert(c Chunk[T], cert *ChunkCertifica
 }
 
 // SetChunkCert sets the chunk certificate for the given chunkID
-// Assumes the caller has already verified the cert references the provided chunkID
-func (s *ChunkStorage[T]) SetChunkCert(chunkID ids.ID, cert *ChunkCertificate) error {
+// Assumes the caller would call this function with a valid cert.
+func (s *ChunkStorage[T]) SetChunkCert(ctx context.Context, chunkID ids.ID, cert *ChunkCertificate) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	storedChunk, ok := s.chunkMap[chunkID]
+	storedChunk, ok := s.pendingChunkMap[chunkID]
 	if !ok {
 		return fmt.Errorf("failed to store cert for non-existent chunk: %s", chunkID)
+	}
+
+	if err := s.verifier.VerifyCertificate(ctx, cert); err != nil {
+		return fmt.Errorf("failed to store invalid cert for chunk %s : %w", chunkID, err)
 	}
 	storedChunk.Cert = cert
 	return nil
@@ -152,11 +219,13 @@ func (s *ChunkStorage[T]) SetChunkCert(chunkID ids.ID, cert *ChunkCertificate) e
 // 3. Generate a local signature share and store it in memory
 // 4. Return the local signature share
 // TODO refactor and merge with AddLocalChunkWithCert
+// Assumes caller has already verified this does not add a duplicate chunk
+// Assumes that if the given chunk is a pending chunk, it would not surpass the producer's rate limit.
 func (s *ChunkStorage[T]) VerifyRemoteChunk(c Chunk[T]) (*warp.BitSetSignature, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	chunkCertInfo, ok := s.chunkMap[c.id]
+	chunkCertInfo, ok := s.pendingChunkMap[c.id]
 	if ok {
 		return chunkCertInfo.Cert.Signature, nil
 	}
@@ -169,14 +238,25 @@ func (s *ChunkStorage[T]) VerifyRemoteChunk(c Chunk[T]) (*warp.BitSetSignature, 
 	return nil, nil
 }
 
+// putVerifiedChunk assumes that the given chunk is guaranteed not to surpass the producer's rate limit.
+// The rate limit is being checked via a call to CheckRateLimit from BuildChunk (for locally generated chunks)
+// and ChunkSignatureRequestVerifier.Verify for incoming chunk signature requests.
 func (s *ChunkStorage[T]) putVerifiedChunk(c Chunk[T], cert *ChunkCertificate) error {
 	if err := s.chunkDB.Put(pendingChunkKey(c.Expiry, c.id), c.bytes); err != nil {
 		return err
 	}
 	s.chunkEMap.Add([]emapChunk[T]{{chunk: c}})
 
+	if chunkCert, ok := s.pendingChunkMap[c.id]; ok {
+		if cert != nil {
+			chunkCert.Cert = cert
+		}
+		return nil
+	}
 	chunkCert := &StoredChunkSignature[T]{Chunk: c, Cert: cert}
-	s.chunkMap[c.id] = chunkCert
+	s.pendingChunkMap[c.id] = chunkCert
+	s.pendingChunksSizes[c.Producer] += uint64(len(c.bytes))
+
 	return nil
 }
 
@@ -195,22 +275,22 @@ func (s *ChunkStorage[T]) SetMin(updatedMin int64, saveChunks []ids.ID) error {
 		return fmt.Errorf("failed to update persistent min slot: %w", err)
 	}
 	for _, saveChunkID := range saveChunks {
-		chunk, ok := s.chunkMap[saveChunkID]
+		chunk, ok := s.pendingChunkMap[saveChunkID]
 		if !ok {
 			return fmt.Errorf("failed to save chunk %s", saveChunkID)
 		}
-		chunk.Available = true
 		if err := batch.Put(acceptedChunkKey(chunk.Chunk.Expiry, chunk.Chunk.id), chunk.Chunk.bytes); err != nil {
 			return fmt.Errorf("failed to save chunk %s: %w", saveChunkID, err)
 		}
+		s.discardPendingChunk(saveChunkID)
 	}
 	expiredChunks := s.chunkEMap.SetMin(updatedMin)
 	for _, chunkID := range expiredChunks {
-		chunk, ok := s.chunkMap[chunkID]
+		chunk, ok := s.pendingChunkMap[chunkID]
 		if !ok {
 			continue
 		}
-		delete(s.chunkMap, chunkID)
+		s.discardPendingChunk(chunkID)
 		// TODO: switch to using DeleteRange(nil, pendingChunkKey(updatedMin, ids.Empty)) after
 		// merging main
 		if err := batch.Delete(pendingChunkKey(chunk.Chunk.Expiry, chunk.Chunk.id)); err != nil {
@@ -221,7 +301,22 @@ func (s *ChunkStorage[T]) SetMin(updatedMin int64, saveChunks []ids.ID) error {
 	if err := batch.Write(); err != nil {
 		return fmt.Errorf("failed to write SetMin batch: %w", err)
 	}
+	s.verifier.SetMin(updatedMin)
 	return nil
+}
+
+// discardPendingChunk removes the given chunkID from the
+// pending chunk map as well as from the pending chunks producers map.
+func (s *ChunkStorage[T]) discardPendingChunk(chunkID ids.ID) {
+	chunk, ok := s.pendingChunkMap[chunkID]
+	if !ok {
+		return
+	}
+	delete(s.pendingChunkMap, chunkID)
+	s.pendingChunksSizes[chunk.Chunk.Producer] -= uint64(len(chunk.Chunk.bytes))
+	if s.pendingChunksSizes[chunk.Chunk.Producer] == 0 {
+		delete(s.pendingChunksSizes, chunk.Chunk.Producer)
+	}
 }
 
 // GatherChunkCerts provides a slice of chunk certificates to build
@@ -231,9 +326,9 @@ func (s *ChunkStorage[T]) GatherChunkCerts() []*ChunkCertificate {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
-	chunkCerts := make([]*ChunkCertificate, 0, len(s.chunkMap))
-	for _, chunk := range s.chunkMap {
-		if chunk.Cert == nil || chunk.Available {
+	chunkCerts := make([]*ChunkCertificate, 0, len(s.pendingChunkMap))
+	for _, chunk := range s.pendingChunkMap {
+		if chunk.Cert == nil {
 			continue
 		}
 		chunkCerts = append(chunkCerts, chunk.Cert)
@@ -244,28 +339,29 @@ func (s *ChunkStorage[T]) GatherChunkCerts() []*ChunkCertificate {
 // GetChunkBytes returns the corresponding chunk bytes of the requested chunk
 // Both the slot and chunkID must be provided to create the relevant DB key, which
 // includes the slot to create a more sequential DB workload.
-func (s *ChunkStorage[T]) GetChunkBytes(expiry int64, chunkID ids.ID) ([]byte, bool, error) {
+func (s *ChunkStorage[T]) GetChunkBytes(expiry int64, chunkID ids.ID) ([]byte, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
-	chunk, ok := s.chunkMap[chunkID]
+	chunk, ok := s.pendingChunkMap[chunkID]
 	if ok {
-		return chunk.Chunk.bytes, chunk.Available, nil
+		return chunk.Chunk.bytes, nil
 	}
 
-	if expiry < s.minimumExpiry { // Chunk can only be in accepted section of the DB
-		chunkBytes, err := s.chunkDB.Get(acceptedChunkKey(expiry, chunkID))
-		if err != nil {
-			return nil, false, fmt.Errorf("failed to fetch accepted chunk bytes for %s: %w", chunkID, err)
-		}
-		return chunkBytes, true, nil
-	}
-
-	chunkBytes, err := s.chunkDB.Get(pendingChunkKey(expiry, chunkID))
+	chunkBytes, err := s.chunkDB.Get(acceptedChunkKey(expiry, chunkID))
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to fetch chunk bytes for %s: %w", chunkID, err)
+		return nil, fmt.Errorf("failed to fetch accepted chunk bytes for %s: %w", chunkID, err)
 	}
-	return chunkBytes, false, nil
+	return chunkBytes, nil
+}
+
+func (s *ChunkStorage[T]) CheckRateLimit(chunk Chunk[T]) error {
+	weightLimit := s.ruleFactory.GetRules(chunk.Expiry).GetMaxAccumulatedProducerChunkWeight()
+
+	if uint64(len(chunk.bytes))+s.pendingChunksSizes[chunk.Producer] > weightLimit {
+		return ErrChunkRateLimitSurpassed
+	}
+	return nil
 }
 
 func createChunkKey(prefix byte, slot int64, chunkID ids.ID) []byte {
