@@ -23,6 +23,7 @@ import (
 	"github.com/ava-labs/hypersdk/codec"
 	"github.com/ava-labs/hypersdk/consts"
 	"github.com/ava-labs/hypersdk/internal/emap"
+	"github.com/ava-labs/hypersdk/internal/typedclient"
 	"github.com/ava-labs/hypersdk/internal/validitywindow"
 	"github.com/ava-labs/hypersdk/proto/pb/dsmr"
 	"github.com/ava-labs/hypersdk/utils"
@@ -44,7 +45,6 @@ var (
 	ErrInvalidBlockTimestamp               = errors.New("invalid block timestamp")
 	ErrInvalidWarpSignature                = errors.New("invalid warp signature")
 	ErrInvalidSignatureType                = errors.New("invalid signature type")
-	ErrFailedToReplicate                   = errors.New("failed to replicate to sufficient stake")
 )
 
 type ChainState interface {
@@ -128,8 +128,8 @@ type Node[T Tx] struct {
 	Signer                       warp.Signer
 	LastAccepted                 Block
 	ruleFactory                  RuleFactory
-	getChunkClient               *TypedClient[*dsmr.GetChunkRequest, Chunk[T], []byte]
-	chunkCertificateGossipClient *TypedClient[[]byte, []byte, *dsmr.ChunkCertificateGossip]
+	getChunkClient               *typedclient.TypedClient[*dsmr.GetChunkRequest, Chunk[T], []byte]
+	chunkCertificateGossipClient *typedclient.TypedClient[[]byte, []byte, *dsmr.ChunkCertificateGossip]
 	chainState                   ChainState
 	chunkSignatureAggregator     *acp118.SignatureAggregator
 
@@ -212,7 +212,7 @@ func (n *Node[T]) BuildChunk(
 		return fmt.Errorf("failed to get canonical validator set: %w", err)
 	}
 
-	aggregatedMsg, _, _, ok, err := n.chunkSignatureAggregator.AggregateSignatures(
+	aggregatedMsg, _, _, err := n.chunkSignatureAggregator.AggregateSignatures(
 		ctx,
 		msg,
 		chunk.bytes,
@@ -222,10 +222,6 @@ func (n *Node[T]) BuildChunk(
 	)
 	if err != nil {
 		return fmt.Errorf("failed to aggregate signatures: %w", err)
-	}
-
-	if !ok {
-		return ErrFailedToReplicate
 	}
 
 	bitSetSignature, ok := aggregatedMsg.Signature.(*warp.BitSetSignature)

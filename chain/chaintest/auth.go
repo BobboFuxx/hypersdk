@@ -17,8 +17,9 @@ import (
 const TestAuthTypeID = 0
 
 var (
-	ErrTestAuthVerify            = errors.New("test auth verification error")
-	_                 chain.Auth = (*TestAuth)(nil)
+	ErrTestAuthVerify                   = errors.New("test auth verification error")
+	_                 chain.Auth        = (*TestAuth)(nil)
+	_                 chain.AuthEngines = (*TestAuthEngines)(nil)
 )
 
 type TestAuth struct {
@@ -115,4 +116,21 @@ func (t *TestAuthFactory) MaxUnits() (bandwidth uint64, compute uint64) {
 
 func (t *TestAuthFactory) Address() codec.Address {
 	return t.TestAuth.ActorAddress
+}
+
+type TestAuthEngines struct {
+	GetAuthBatchVerifierF func(authTypeID uint8, cores int, count int) (chain.AuthBatchVerifier, bool)
+}
+
+func (t *TestAuthEngines) GetAuthBatchVerifier(authTypeID uint8, cores int, count int) (chain.AuthBatchVerifier, bool) {
+	return t.GetAuthBatchVerifierF(authTypeID, cores, count)
+}
+
+// NewDummyTestAuthEngines returns an instance of TestAuthEngines with no-op implementations
+func NewDummyTestAuthEngines() *TestAuthEngines {
+	return &TestAuthEngines{
+		GetAuthBatchVerifierF: func(uint8, int, int) (chain.AuthBatchVerifier, bool) {
+			return nil, false
+		},
+	}
 }

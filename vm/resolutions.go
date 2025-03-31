@@ -80,11 +80,14 @@ func (vm *VM) GetExecutionBlock(ctx context.Context, blkID ids.ID) (validitywind
 	_, span := vm.tracer.Start(ctx, "VM.GetExecutionBlock")
 	defer span.End()
 
-	blk, err := vm.consensusIndex.GetBlock(ctx, blkID)
-	if err != nil {
-		return nil, err
+	if vm.consensusIndex != nil {
+		blk, err := vm.consensusIndex.GetBlock(ctx, blkID)
+		if err == nil {
+			return blk, nil
+		}
 	}
-	return blk, nil
+
+	return vm.chainStore.GetBlock(ctx, blkID)
 }
 
 func (vm *VM) LastAcceptedBlock(ctx context.Context) (*chain.StatelessBlock, error) {
@@ -157,14 +160,6 @@ func (vm *VM) MetadataManager() chain.MetadataManager {
 func (vm *VM) SubmitTx(ctx context.Context, tx *chain.Transaction) error {
 	errs := vm.Submit(ctx, []*chain.Transaction{tx})
 	return errs[0]
-}
-
-func (vm *VM) GetAuthBatchVerifier(authTypeID uint8, cores int, count int) (chain.AuthBatchVerifier, bool) {
-	bv, ok := vm.authEngine[authTypeID]
-	if !ok {
-		return nil, false
-	}
-	return bv.GetBatchVerifier(cores, count), ok
 }
 
 func (vm *VM) UnitPrices(context.Context) (fees.Dimensions, error) {

@@ -5,7 +5,9 @@ package chain_test
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -18,21 +20,22 @@ import (
 	"github.com/ava-labs/hypersdk/internal/validitywindow"
 	"github.com/ava-labs/hypersdk/internal/validitywindow/validitywindowtest"
 	"github.com/ava-labs/hypersdk/state"
+	"github.com/ava-labs/hypersdk/state/balance"
 	"github.com/ava-labs/hypersdk/state/metadata"
 	"github.com/ava-labs/hypersdk/utils"
 )
 
-var (
-	feeKey = string(chain.FeeKey([]byte{2}))
-
-	errMockValidityWindow = errors.New("mock validity window error")
-)
+var errMockValidityWindow = errors.New("mock validity window error")
 
 func TestPreExecutor(t *testing.T) {
 	testRules := genesis.NewDefaultRules()
 	ruleFactory := genesis.ImmutableRuleFactory{
 		Rules: testRules,
 	}
+
+	testMetadataManager := metadata.NewDefaultManager()
+	feeKey := string(chain.FeeKey(testMetadataManager.FeePrefix()))
+
 	validTx := &chain.Transaction{
 		TransactionData: chain.TransactionData{
 			Base: chain.Base{
@@ -45,6 +48,9 @@ func TestPreExecutor(t *testing.T) {
 		Auth: chaintest.NewDummyTestAuth(),
 	}
 
+	bh := balance.NewPrefixBalanceHandler([]byte{0})
+	balanceKey := string(bh.BalanceKey(validTx.Auth.Sponsor()))
+
 	tests := []struct {
 		name           string
 		state          map[string][]byte
@@ -55,7 +61,8 @@ func TestPreExecutor(t *testing.T) {
 		{
 			name: "valid tx",
 			state: map[string][]byte{
-				feeKey: {},
+				feeKey:     {},
+				balanceKey: binary.BigEndian.AppendUint64(nil, math.MaxUint64),
 			},
 			tx:             validTx,
 			validityWindow: &validitywindowtest.MockTimeValidityWindow[*chain.Transaction]{},
@@ -154,8 +161,8 @@ func TestPreExecutor(t *testing.T) {
 			preExecutor := chain.NewPreExecutor(
 				&ruleFactory,
 				tt.validityWindow,
-				metadata.NewDefaultManager(),
-				&mockBalanceHandler{},
+				testMetadataManager,
+				bh,
 			)
 
 			r.ErrorIs(

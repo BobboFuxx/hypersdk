@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -29,21 +30,24 @@ import (
 	"github.com/ava-labs/hypersdk/internal/validitywindow/validitywindowtest"
 	"github.com/ava-labs/hypersdk/internal/workers"
 	"github.com/ava-labs/hypersdk/state"
+	"github.com/ava-labs/hypersdk/state/balance"
 	"github.com/ava-labs/hypersdk/state/metadata"
 	"github.com/ava-labs/hypersdk/utils"
 )
 
-var (
-	_ chain.AuthVM = (*mockAuthVM)(nil)
-
-	heightKey    = string(chain.HeightKey([]byte{0}))
-	timestampKey = string(chain.TimestampKey([]byte{1}))
-
-	errMockVerifyExpiryReplayProtection = errors.New("mock validity window error")
-)
+var errMockVerifyExpiryReplayProtection = errors.New("mock validity window error")
 
 func TestProcessorExecute(t *testing.T) {
 	testRules := genesis.NewDefaultRules()
+
+	testMetadataManager := metadata.NewDefaultManager()
+	feeKey := string(chain.FeeKey(testMetadataManager.FeePrefix()))
+	heightKey := string(chain.HeightKey(testMetadataManager.HeightPrefix()))
+	timestampKey := string(chain.TimestampKey(testMetadataManager.TimestampPrefix()))
+	pk, err := ed25519.GeneratePrivateKey()
+	require.NoError(t, err)
+	balanceHandler := balance.NewPrefixBalanceHandler([]byte{0})
+
 	tests := []struct {
 		name           string
 		validityWindow chain.ValidityWindow
@@ -431,18 +435,20 @@ func TestProcessorExecute(t *testing.T) {
 			name:           "invalid transaction signature",
 			validityWindow: &validitywindowtest.MockTimeValidityWindow[*chain.Transaction]{},
 			newViewF: func(r *require.Assertions) merkledb.View {
+				auth := auth.ED25519{
+					Signer: pk.PublicKey(),
+				}
 				v, err := createTestView(map[string][]byte{
 					heightKey:    binary.BigEndian.AppendUint64(nil, 0),
 					timestampKey: binary.BigEndian.AppendUint64(nil, 0),
 					feeKey:       {},
+					string(balanceHandler.BalanceKey(auth.Sponsor())): binary.BigEndian.AppendUint64(nil, math.MaxUint64),
 				})
+
 				r.NoError(err)
 				return v
 			},
 			newBlockF: func(r *require.Assertions, parentRoot ids.ID) *chain.StatelessBlock {
-				p, err := ed25519.GeneratePrivateKey()
-				r.NoError(err)
-
 				tx, err := chain.NewTransaction(
 					chain.Base{
 						Timestamp: utils.UnixRMilli(
@@ -452,7 +458,7 @@ func TestProcessorExecute(t *testing.T) {
 					},
 					[]chain.Action{},
 					&auth.ED25519{
-						Signer: p.PublicKey(),
+						Signer: pk.PublicKey(),
 					},
 				)
 				r.NoError(err)
@@ -485,9 +491,9 @@ func TestProcessorExecute(t *testing.T) {
 				&logging.NoLog{},
 				&genesis.ImmutableRuleFactory{Rules: testRules},
 				workers.NewSerial(),
-				&mockAuthVM{},
-				metadata.NewDefaultManager(),
-				&mockBalanceHandler{},
+				chaintest.NewDummyTestAuthEngines(),
+				testMetadataManager,
+				balanceHandler,
 				tt.validityWindow,
 				metrics,
 				chain.NewDefaultConfig(),
@@ -530,14 +536,4 @@ func createTestView(mp map[string][]byte) (merkledb.View, error) {
 	}
 
 	return db, nil
-}
-
-type mockAuthVM struct{}
-
-func (*mockAuthVM) GetAuthBatchVerifier(uint8, int, int) (chain.AuthBatchVerifier, bool) {
-	return nil, false
-}
-
-func (*mockAuthVM) Logger() logging.Logger {
-	panic("unimplemented")
 }

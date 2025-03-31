@@ -23,12 +23,12 @@ import (
 
 	"github.com/ava-labs/hypersdk/abi"
 	"github.com/ava-labs/hypersdk/api"
+	"github.com/ava-labs/hypersdk/auth"
 	"github.com/ava-labs/hypersdk/chain"
 	"github.com/ava-labs/hypersdk/chainindex"
 	"github.com/ava-labs/hypersdk/codec"
 	"github.com/ava-labs/hypersdk/consts"
 	"github.com/ava-labs/hypersdk/event"
-	"github.com/ava-labs/hypersdk/fees"
 	"github.com/ava-labs/hypersdk/genesis"
 	"github.com/ava-labs/hypersdk/internal/builder"
 	"github.com/ava-labs/hypersdk/internal/gossiper"
@@ -37,13 +37,10 @@ import (
 	"github.com/ava-labs/hypersdk/internal/validators"
 	"github.com/ava-labs/hypersdk/internal/validitywindow"
 	"github.com/ava-labs/hypersdk/internal/workers"
-	"github.com/ava-labs/hypersdk/state"
-	"github.com/ava-labs/hypersdk/state/tstate"
 	"github.com/ava-labs/hypersdk/statesync"
 	"github.com/ava-labs/hypersdk/storage"
 
 	avatrace "github.com/ava-labs/avalanchego/trace"
-	internalfees "github.com/ava-labs/hypersdk/internal/fees"
 	hsnow "github.com/ava-labs/hypersdk/snow"
 )
 
@@ -62,6 +59,7 @@ const (
 	changeProofHandlerID = 0x0
 	rangeProofHandlerID  = 0x1
 	txGossipHandlerID    = 0x2
+	blockFetchHandleID   = 0x3
 )
 
 var ErrNotAdded = errors.New("not added")
@@ -90,7 +88,6 @@ type VM struct {
 
 	chain                   *chain.Chain
 	chainTimeValidityWindow *validitywindow.TimeValidityWindow[*chain.Transaction]
-	syncer                  *validitywindow.Syncer[*chain.Transaction]
 	SyncClient              *statesync.Client[*chain.ExecutionBlock]
 
 	consensusIndex *hsnow.ConsensusIndex[*chain.ExecutionBlock, *chain.OutputBlock, *chain.OutputBlock]
@@ -112,7 +109,7 @@ type VM struct {
 	actionCodec           *codec.TypeParser[chain.Action]
 	authCodec             *codec.TypeParser[chain.Auth]
 	outputCodec           *codec.TypeParser[codec.Typed]
-	authEngine            map[uint8]AuthEngine
+	authEngines           auth.Engines
 
 	// authVerifiers are used to verify signatures in parallel
 	// with limited parallelism
@@ -133,7 +130,7 @@ func New(
 	actionCodec *codec.TypeParser[chain.Action],
 	authCodec *codec.TypeParser[chain.Auth],
 	outputCodec *codec.TypeParser[codec.Typed],
-	authEngine map[uint8]AuthEngine,
+	authEngines auth.Engines,
 	options ...Option,
 ) (*VM, error) {
 	allocatedNamespaces := set.NewSet[string](len(options))
@@ -156,7 +153,7 @@ func New(
 		actionCodec:           actionCodec,
 		authCodec:             authCodec,
 		outputCodec:           outputCodec,
-		authEngine:            authEngine,
+		authEngines:           authEngines,
 		genesisAndRuleFactory: genesisFactory,
 		options:               options,
 	}, nil
@@ -321,7 +318,7 @@ func (vm *VM) Initialize(
 		vm.MetadataManager(),
 		vm.BalanceHandler(),
 		vm.AuthVerifiers(),
-		vm,
+		vm.authEngines,
 		vm.chainTimeValidityWindow,
 		chainConfig,
 	)
@@ -334,6 +331,10 @@ func (vm *VM) Initialize(
 	}
 
 	if err := vm.initStateSync(ctx); err != nil {
+		return nil, nil, nil, false, err
+	}
+
+	if err := vm.populateValidityWindow(ctx); err != nil {
 		return nil, nil, nil, false, err
 	}
 
@@ -487,51 +488,27 @@ func (vm *VM) extractLatestOutputBlock(ctx context.Context) (*chain.OutputBlock,
 }
 
 func (vm *VM) initGenesisAsLastAccepted(ctx context.Context) (*chain.OutputBlock, error) {
-	ts := tstate.New(0)
-	tsv := ts.NewView(state.CompletePermissions, vm.stateDB, 0)
-	if err := vm.genesis.InitializeState(ctx, vm.tracer, tsv, vm.balanceHandler); err != nil {
-		return nil, fmt.Errorf("failed to initialize genesis state: %w", err)
-	}
-
-	// Update chain metadata
-	if err := tsv.Insert(ctx, chain.HeightKey(vm.metadataManager.HeightPrefix()), binary.BigEndian.AppendUint64(nil, 0)); err != nil {
-		return nil, fmt.Errorf("failed to set genesis height: %w", err)
-	}
-	if err := tsv.Insert(ctx, chain.TimestampKey(vm.metadataManager.TimestampPrefix()), binary.BigEndian.AppendUint64(nil, 0)); err != nil {
-		return nil, fmt.Errorf("failed to set genesis timestamp: %w", err)
-	}
-	genesisRules := vm.ruleFactory.GetRules(0)
-	feeManager := internalfees.NewManager(nil)
-	minUnitPrice := genesisRules.GetMinUnitPrice()
-	for i := fees.Dimension(0); i < fees.FeeDimensions; i++ {
-		feeManager.SetUnitPrice(i, minUnitPrice[i])
-		vm.snowCtx.Log.Info("set genesis unit price", zap.Int("dimension", int(i)), zap.Uint64("price", feeManager.UnitPrice(i)))
-	}
-	if err := tsv.Insert(ctx, chain.FeeKey(vm.metadataManager.FeePrefix()), feeManager.Bytes()); err != nil {
-		return nil, fmt.Errorf("failed to set genesis fee manager: %w", err)
-	}
-
-	// Commit genesis block post-execution state and compute root
-	tsv.Commit()
-	view, err := vm.stateDB.NewView(ctx, merkledb.ViewChanges{
-		MapOps:       ts.ChangedKeys(),
-		ConsumeBytes: true,
-	})
+	genesisExecutionBlk, genesisView, err := chain.NewGenesisCommit(
+		ctx,
+		vm.stateDB,
+		vm.genesis,
+		vm.metadataManager,
+		vm.balanceHandler,
+		vm.ruleFactory,
+		vm.tracer,
+		vm.snowCtx.Log,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to commit genesis initialized state diff: %w", err)
+		return nil, fmt.Errorf("failed to create genesis state diff: %w", err)
 	}
-	if err := view.CommitToDB(ctx); err != nil {
+
+	vm.snowCtx.Log.Info(
+		"genesis state created",
+		zap.Stringer("root", genesisExecutionBlk.GetStateRoot()),
+	)
+
+	if err := genesisView.CommitToDB(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit genesis view: %w", err)
-	}
-	root, err := vm.stateDB.GetMerkleRoot(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get initialized genesis root: %w", err)
-	}
-	vm.snowCtx.Log.Info("genesis state created", zap.Stringer("root", root))
-	// Create genesis block
-	genesisExecutionBlk, err := chain.NewGenesisBlock(root)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create genesis block: %w", err)
 	}
 	if err := vm.chainStore.UpdateLastAccepted(ctx, genesisExecutionBlk); err != nil {
 		return nil, fmt.Errorf("failed to write genesis block: %w", err)
@@ -723,4 +700,30 @@ func (vm *VM) Submit(
 	vm.metrics.mempoolSize.Set(float64(vm.mempool.Len(ctx)))
 	vm.snowCtx.Log.Info("Submitted tx(s)", zap.Int("validTxs", len(validTxs)), zap.Int("invalidTxs", len(errs)-len(validTxs)), zap.Int("mempoolSize", vm.mempool.Len(ctx)))
 	return errs
+}
+
+// populateValidityWindow populates the VM's time validity window on startup,
+// ensuring it contains recent transactions even if state sync is skipped (e.g., due to restart).
+// This is necessary because a node might restart with only a few blocks behind (or slightly ahead)
+// of the network, and thus opt not to trigger state sync. Without backfilling, the node's validity window
+// may be incomplete, causing the node to accept a duplicate transaction that the network already processed.
+
+// When Initialize is called, vm.consensusIndex is nil—it is set later via SetConsensusIndex.
+// Therefore, we must use the chainStore (which reads blocks from disk) to backfill the validity window.
+// This prepopulation ensures the validity window is complete, even if state sync is skipped.
+func (vm *VM) populateValidityWindow(ctx context.Context) error {
+	lastAcceptedBlkHeight, err := vm.chainStore.GetLastAcceptedHeight(ctx)
+	if err != nil {
+		if errors.Is(err, database.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	lastAcceptedBlock, err := vm.chainStore.GetBlockByHeight(ctx, lastAcceptedBlkHeight)
+	if err != nil {
+		return err
+	}
+
+	vm.chainTimeValidityWindow.PopulateValidityWindow(ctx, lastAcceptedBlock)
+	return nil
 }
